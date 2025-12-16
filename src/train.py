@@ -94,7 +94,14 @@ def main() -> None:
         "--hf_model_id",
         type=str,
         default="facebook/dinov3-vit7b16-pretrain-lvd1689m",
-        help="HuggingFace model id for DINOv3.",
+        help="HuggingFace model id for DINOv3. "
+        "Faster alternatives: 'facebook/dinov2-vitb14' (base), "
+        "'facebook/dinov2-vits14' (small, fastest)",
+    )
+    ap.add_argument(
+        "--compile_model",
+        action="store_true",
+        help="Use torch.compile() for faster inference (PyTorch 2.0+, may require CUDA)",
     )
     ap.add_argument(
         "--state_mapping",
@@ -120,6 +127,18 @@ def main() -> None:
     ap.add_argument("--fusion_layers", type=int, default=2)
     ap.add_argument("--fusion_heads", type=int, default=8)
     ap.add_argument("--fusion_dropout", type=float, default=0.1)
+    ap.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+        help="Number of DataLoader workers (increase for faster data loading)",
+    )
+    ap.add_argument(
+        "--prefetch_factor",
+        type=int,
+        default=2,
+        help="DataLoader prefetch factor (higher = more prefetching)",
+    )
 
     args = ap.parse_args()
 
@@ -171,10 +190,18 @@ def main() -> None:
     # --- DINOv3 preprocessing params (mean/std/size) from HF processor
     log_step("DINOv3 Config", f"Fetching processor params for {args.hf_model_id}...")
     pp = DinoV3Encoder.processor_params(args.hf_model_id)
+    image_size = pp["image_size"]
     log_step(
         "Success",
-        f"Image size: {pp['image_size']}, Mean: {pp['mean']}, Std: {pp['std']}",
+        f"Image size: {image_size}x{image_size}, Mean: {pp['mean']}, Std: {pp['std']}",
     )
+    if image_size > 224:
+        log_step(
+            "Note",
+            f"Large image size ({image_size}x{image_size}) will slow training. "
+            "Consider smaller sizes (224x224 or 256x256) if acceptable.",
+            level="info",
+        )
 
     # Dataset + loader
     log_step("Dataset", f"Creating StreetViewDataset from {train_csv}...")
@@ -191,15 +218,18 @@ def main() -> None:
 
     log_step(
         "DataLoader",
-        f"Creating DataLoader (batch_size={args.batch_size}, num_workers=1)...",
+        f"Creating DataLoader (batch_size={args.batch_size}, "
+        f"num_workers={args.num_workers}, prefetch_factor={args.prefetch_factor})...",
     )
     loader = DataLoader(
         ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=1,
-        pin_memory=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
         collate_fn=collate_streetview,
+        persistent_workers=(args.num_workers > 0),
     )
     log_step("Success", f"Batches per epoch: {len(loader):,}")
 
@@ -216,12 +246,18 @@ def main() -> None:
         log_step("", f"  S2 Level: {geo_cells.meta['s2_level']}")
 
     # Create mapping from sample_id to row index (for cell_id lookup)
+    # Also pre-allocate cell_ids tensor on GPU for faster lookup
     df_geo = pd.read_csv(train_csv)
     sample_id_to_idx = {int(sid): idx for idx, sid in enumerate(df_geo["sample_id"])}
     log_step(
         "Mapping",
         f"Created sample_id -> row_index mapping for {len(sample_id_to_idx):,} samples",
     )
+
+    # Pre-allocate cell_ids tensor on GPU for faster batch lookup
+    cell_ids_tensor = torch.from_numpy(cell_ids_np).to(device)
+    centroids_tensor = torch.from_numpy(centroids_np).to(device).float()
+    log_step("Pre-allocation", "Pre-allocated cell_ids and centroids tensors on GPU")
 
     log_step("Saving", "Saving geo cell data...")
     np.save(out_dir / "geo_cell_centroids.npy", centroids_np)
@@ -231,9 +267,31 @@ def main() -> None:
     log_section("🧠 Model Initialization")
 
     log_step("Encoder", f"Loading DINOv3 encoder: {args.hf_model_id}...")
-    encoder = DinoV3Encoder(model_id=args.hf_model_id, freeze=True).to(device)
+    # Use bfloat16 for large models to save memory and potentially speed up on modern GPUs
+    torch_dtype = torch.bfloat16 if device.type == "cuda" else None
+    encoder = DinoV3Encoder(
+        model_id=args.hf_model_id, freeze=True, torch_dtype=torch_dtype
+    ).to(device)
     embed_dim = encoder.embed_dim
     log_step("Success", f"Encoder embed dimension: {embed_dim}")
+
+    # Warn if using a very large model
+    if "7b" in args.hf_model_id.lower() or "giant" in args.hf_model_id.lower():
+        log_step(
+            "Warning",
+            "Using a large model (7B+). Consider using a smaller variant for faster training:",
+            level="warning",
+        )
+        log_step(
+            "",
+            "  - 'facebook/dinov2-vitb14' (base, ~86M params, ~10-20x faster)",
+            level="warning",
+        )
+        log_step(
+            "",
+            "  - 'facebook/dinov2-vits14' (small, ~22M params, ~30-50x faster)",
+            level="warning",
+        )
 
     log_step("Fusion", "Creating DirectionalFusionTransformer...")
     log_step(
@@ -262,12 +320,34 @@ def main() -> None:
         geo_head=geo_head,
     ).to(device)
 
+    # Compile model for faster inference (PyTorch 2.0+)
+    if args.compile_model:
+        try:
+            log_step("Compiling", "Compiling model with torch.compile()...")
+            model = torch.compile(model, mode="reduce-overhead")
+            log_step("Success", "Model compiled for faster inference")
+        except Exception as e:
+            log_step(
+                "Warning",
+                f"torch.compile() failed (may not be available): {e}",
+                level="warning",
+            )
+
     # Count trainable parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log_step("Success", "Model created")
     log_step("", f"  Total parameters: {total_params:,}")
     log_step("", f"  Trainable parameters: {trainable_params:,}")
+
+    # Estimate model size in GB
+    encoder_params = sum(p.numel() for p in encoder.parameters())
+    model_size_gb = total_params * 4 / (1024**3)  # Assuming float32 (4 bytes)
+    log_step(
+        "",
+        f"  Encoder parameters: {encoder_params:,} ({encoder_params * 4 / (1024**3):.2f} GB)",
+    )
+    log_step("", f"  Estimated model size: {model_size_gb:.2f} GB")
 
     log_section("⚙️  Training Setup")
 
@@ -311,23 +391,26 @@ def main() -> None:
         n = 0
 
         for batch_idx, batch in enumerate(loader):
-            images = batch["images"].to(device)  # (B,4,3,H,W)
-            state_class = batch["state_class"].to(device)  # (B,) contiguous
-            latlon = batch["latlon"].to(device)  # (B,2)
+            images = batch["images"].to(device, non_blocking=True)  # (B,4,3,H,W)
+            state_class = batch["state_class"].to(device, non_blocking=True)  # (B,)
+            latlon = batch["latlon"].to(device, non_blocking=True)  # (B,2)
 
-            # Get true cell ids from geo_cells using sample_id -> row_index mapping
+            # Get true cell ids using pre-allocated GPU tensor (much faster than CPU->GPU transfer)
             sample_ids = batch["sample_id"].cpu().numpy()
-            row_indices = np.array([sample_id_to_idx[int(sid)] for sid in sample_ids])
-            true_cell = torch.from_numpy(cell_ids_np[row_indices]).to(device)
+            row_indices = torch.tensor(
+                [sample_id_to_idx[int(sid)] for sid in sample_ids],
+                device=device,
+                dtype=torch.long,
+            )
+            true_cell = cell_ids_tensor[row_indices]
 
             dtype = "cuda" if device.type == "cuda" else "cpu"
             with autocast(device_type=dtype, enabled=(device.type == "cuda")):
                 out = model(images)
 
-                # Get predicted cell and use its centroid
-                pred_cell_indices = out.geo.cell_logits.argmax(dim=-1).cpu().numpy()
-                selected_centroids = centroids_np[pred_cell_indices]
-                centroid = torch.from_numpy(selected_centroids).to(device).float()
+                # Get predicted cell and use its centroid (all on GPU, no CPU sync)
+                pred_cell_indices = out.geo.cell_logits.argmax(dim=-1)  # (B,)
+                centroid = centroids_tensor[pred_cell_indices]  # (B, 2)
                 pred_latlon = centroid + out.geo.residual
 
                 loss_out = loss_fn(
@@ -346,11 +429,13 @@ def main() -> None:
 
             bs = len(images)
             n += bs
-            running["total"] += float(loss_out.total.detach().cpu()) * bs
-            for k, v in loss_out.parts.items():
-                running[k] += float(v.detach().cpu()) * bs
+            # Accumulate losses (detach to avoid keeping graph, but keep on GPU until final sync)
+            with torch.no_grad():
+                running["total"] += loss_out.total.item() * bs
+                for k, v in loss_out.parts.items():
+                    running[k] += v.item() * bs
 
-            # Progress update every 100 batches
+            # Progress update every 100 batches (reduced overhead)
             if (batch_idx + 1) % 100 == 0 or (batch_idx + 1) == len(loader):
                 progress_pct = 100 * (batch_idx + 1) / len(loader)
                 current_loss = running["total"] / n
