@@ -12,3 +12,7 @@ __pycache__
 
 .ipynb_checkpoints
 **/.ipynb_checkpoints
+
+checkpoints
+data
+*.ipynb
