@@ -65,7 +65,8 @@ class HaversineLoss(nn.Module):
     def forward(
         self, pred_latlon: torch.Tensor, true_latlon: torch.Tensor
     ) -> torch.Tensor:
-        d = haversine_km(pred_latlon, true_latlon)
+        d_km = haversine_km(pred_latlon, true_latlon)
+        d = d_km / 5000.0
         if self.reduction == "mean":
             return d.mean()
         if self.reduction == "sum":

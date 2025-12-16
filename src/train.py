@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Tuple
 
 import numpy as np
 import torch
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from datasets import StateIndexMapper, StreetViewDataset, collate_streetview
@@ -17,6 +16,8 @@ from models.geo_geussr import GeoGuessrModel, StateHead, GeoHead
 
 from losses import MultiTaskLoss
 
+from geo_cell import build_geo_cells
+
 
 def seed_everything(seed: int = 42) -> None:
     import random
@@ -25,28 +26,6 @@ def seed_everything(seed: int = 42) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def build_dummy_geo_cells(train_csv: Path) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Placeholder geo-cell builder.
-
-    Replace with:
-      - S2 cells, or
-      - KMeans on 3D Earth coordinates
-
-    Dummy version:
-      - single centroid at mean(lat,lon)
-      - all samples assigned to cell 0
-    """
-    import pandas as pd
-
-    df = pd.read_csv(train_csv)
-    centroid = np.array(
-        [[df["latitude"].mean(), df["longitude"].mean()]], dtype=np.float32
-    )
-    cell_id = np.zeros(len(df), dtype=np.int64)
-    return centroid, cell_id
 
 
 def main() -> None:
@@ -74,6 +53,12 @@ def main() -> None:
         type=str,
         default="data/state_mapping.csv",
         help="Path to state_mapping.csv (relative to repo root or absolute).",
+    )
+    ap.add_argument(
+        "--geo_centroids",
+        type=str,
+        default="data/geo_cell_centroids.npy",
+        help="Path to geo_cell_centroids.npy (relative to repo root or absolute).",
     )
 
     # Fusion
@@ -115,13 +100,13 @@ def main() -> None:
         ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=1,
         pin_memory=True,
         collate_fn=collate_streetview,
     )
 
     # Geo-cells (placeholder)
-    centroids_np, cell_ids_np = build_dummy_geo_cells(train_csv)
+    centroids_np, cell_ids_np = build_geo_cells(train_csv, method=args.geo_method)
     np.save(out_dir / "geo_cell_centroids.npy", centroids_np)
     np.save(out_dir / "geo_cell_ids.npy", cell_ids_np)
 
@@ -161,15 +146,24 @@ def main() -> None:
         lr=args.lr,
         weight_decay=1e-2,
     )
-    scaler = GradScaler(enabled=(device.type == "cuda"))
+    scaler = GradScaler(
+        "cuda" if device.type == "cuda" else "cpu", enabled=(device.type == "cuda")
+    )
 
     # Training loop
+    print(f"Starting training on {device}...")
+    print(f"Dataset size: {len(ds)}, Batches per epoch: {len(loader)}")
     model.train()
     for epoch in range(1, args.epochs + 1):
         running = {"total": 0.0, "state": 0.0, "cell": 0.0, "gps": 0.0}
         n = 0
 
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader):
+            if batch_idx % 100 == 0:
+                print(
+                    f"Epoch {epoch}/{args.epochs}, Batch {batch_idx}/{len(loader)}",
+                    flush=True,
+                )
             images = batch["images"].to(device)  # (B,4,3,H,W)
             state_class = batch["state_class"].to(device)  # (B,) contiguous
             latlon = batch["latlon"].to(device)  # (B,2)
@@ -177,7 +171,8 @@ def main() -> None:
             # Dummy cell ids (replace with real mapping)
             true_cell = torch.zeros(len(images), dtype=torch.long, device=device)
 
-            with autocast(enabled=(device.type == "cuda")):
+            dtype = "cuda" if device.type == "cuda" else "cpu"
+            with autocast(device_type=dtype, enabled=(device.type == "cuda")):
                 out = model(images)
 
                 # centroid(top cell) + residual (dummy: only one centroid)
@@ -211,7 +206,7 @@ def main() -> None:
         msg = " | ".join(
             [f"{k}: {running[k] / n:.4f}" for k in ["total", "state", "cell", "gps"]]
         )
-        print(f"Epoch {epoch}/{args.epochs} - {msg}")
+        print(f"Epoch {epoch}/{args.epochs} - {msg}", flush=True)
 
         ckpt_path = out_dir / f"model_epoch_{epoch}.pt"
         torch.save(
@@ -227,7 +222,7 @@ def main() -> None:
             ckpt_path,
         )
 
-    print(f"Done. Checkpoints saved to: {out_dir}")
+    print(f"Done. Checkpoints saved to: {out_dir}", flush=True)
 
 
 if __name__ == "__main__":
