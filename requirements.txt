@@ -2,3 +2,5 @@ torch
 torchvision
 transformers
 pandas
+s2sphere
+scikit-learn
