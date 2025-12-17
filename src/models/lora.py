@@ -95,9 +95,11 @@ def add_lora_to_attention(
         # Copy weights from qkv (assuming qkv is [Q; K; V] concatenated)
         with torch.no_grad():
             q_proj.weight.copy_(qkv.weight[:dim])
+            k_proj.weight.copy_(qkv.weight[dim : 2 * dim])
             v_proj.weight.copy_(qkv.weight[2 * dim :])
             if qkv.bias is not None:
                 q_proj.bias.copy_(qkv.bias[:dim])
+                k_proj.bias.copy_(qkv.bias[dim : 2 * dim])
                 v_proj.bias.copy_(qkv.bias[2 * dim :])
 
         # Freeze base projections by default; LoRA layers hold trainable params

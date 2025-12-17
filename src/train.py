@@ -151,6 +151,12 @@ def main() -> None:
             choices=["s2", "kmeans3d"],
             help="Method for building geo cells: 's2' or 'kmeans3d'.",
         )
+        ap.add_argument(
+            "--num_cells",
+            type=int,
+            default=1024,
+            help="Number of geo cells for method='kmeans3d' (ignored for method='s2').",
+        )
 
         # Fusion
         ap.add_argument("--fusion_layers", type=int, default=2)
@@ -171,88 +177,28 @@ def main() -> None:
             "Higher values keep GPU fed with data.",
         )
 
-        # Encoder finetuning (LoRA + partial unfreeze)
-        ap.add_argument(
-            "--encoder_trainable_layers",
-            type=int,
-            default=2,
-            help="Unfreeze last N transformer blocks of DINOv3 (0 = keep frozen).",
-        )
-        ap.add_argument(
-            "--encoder_lr_scale",
-            type=float,
-            default=0.1,
-            help="Base LR multiplier for unfrozen encoder blocks (before LLRD).",
-        )
-        ap.add_argument(
-            "--encoder_llrd_decay",
-            type=float,
-            default=0.8,
-            help="Layer-wise LR decay for unfrozen encoder blocks (closer to head = higher LR).",
-        )
-        ap.add_argument(
-            "--lora_lr_scale",
-            type=float,
-            default=0.1,
-            help="LR multiplier for LoRA adapters relative to --lr.",
-        )
-
-        # Geo head / loss configuration (mixture default)
-        ap.add_argument(
-            "--geo_head_type",
-            type=str,
-            default="mixture",
-            choices=["mixture", "cell"],
-            help="Geo regression head type: mixture (default) or cell (classification + residual).",
-        )
-        ap.add_argument(
-            "--mixture_components",
-            type=int,
-            default=5,
-            help="Number of mixture components when geo_head_type='mixture'.",
-        )
-        ap.add_argument(
-            "--no_mixture_cell_aux",
-            action="store_true",
-            help="Disable auxiliary cell classification loss for the mixture head.",
-        )
-        ap.add_argument(
-            "--state_smoothing",
-            type=float,
-            default=0.1,
-            help="Label smoothing for the state classification head.",
-        )
-        ap.add_argument(
-            "--lambda_state",
-            type=float,
-            default=1.0,
-            help="Weight for the state classification loss.",
-        )
-        ap.add_argument(
-            "--lambda_cell",
-            type=float,
-            default=0.5,
-            help="Weight for the geo cell loss (primary for cell head, auxiliary for mixture).",
-        )
-        ap.add_argument(
-            "--lambda_gps",
-            type=float,
-            default=1.0,
-            help="Weight for the GPS regression / mixture NLL loss.",
-        )
-        ap.add_argument(
-            "--gps_loss",
-            type=str,
-            default="haversine",
-            choices=["haversine", "huber"],
-            help="GPS regression loss type when using geo_head_type='cell'.",
-        )
-
         return ap
 
     ap = build_arg_parser()
     args = ap.parse_args()
-    mixture_use_cell_aux = not args.no_mixture_cell_aux
+
+    # Defaults for new implementations (kept internal to avoid expanding CLI surface):
+    # - Geo: mixture-of-Gaussians regression (multi-modal) with optional cell aux
+    # - Encoder: LoRA + partial unfreeze of last blocks with LLRD
+    geo_head_type = "mixture"
+    num_components = 5
+    mixture_use_cell_aux = True
+    gps_loss_type = "haversine"  # only relevant if using the legacy cell+residual head
+
+    state_smoothing = 0.1
+    lambda_state = 1.0
+    lambda_cell = 0.5
+    lambda_gps = 1.0
+
+    encoder_trainable_layers = 2
+    encoder_lr_scale = 0.1
+    encoder_llrd_decay = 0.8
+    lora_lr_scale = 0.1
 
     log_step("Configuration", "Parsing arguments...")
     log_step("", f"  Data directory: {args.data_dir}")
@@ -265,19 +211,14 @@ def main() -> None:
     log_step("", f"  Geo method: {args.geo_method}")
     log_step(
         "",
-        f"  Geo head: {args.geo_head_type}"
-        + (
-            f" (K={args.mixture_components}, cell_aux={mixture_use_cell_aux})"
-            if args.geo_head_type == "mixture"
-            else f" (gps_loss={args.gps_loss})"
-        ),
+        f"  Geo head: {geo_head_type} (K={num_components}, cell_aux={mixture_use_cell_aux})",
     )
     log_step(
         "",
-        f"  Encoder finetune: last {args.encoder_trainable_layers} blocks "
-        f"(lr_scale={args.encoder_lr_scale}, decay={args.encoder_llrd_decay})",
+        f"  Encoder finetune: last {encoder_trainable_layers} blocks "
+        f"(lr_scale={encoder_lr_scale}, decay={encoder_llrd_decay})",
     )
-    log_step("", f"  LoRA lr scale: {args.lora_lr_scale}")
+    log_step("", f"  LoRA lr scale: {lora_lr_scale}")
     log_step("", f"  Output directory: {args.out_dir}")
     log_step("", f"  Seed: {args.seed}")
 
@@ -435,7 +376,7 @@ def main() -> None:
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         lora_layers=lora_layers,
-        trainable_layers=args.encoder_trainable_layers,
+        trainable_layers=encoder_trainable_layers,
     ).to(device)
     embed_dim = encoder.embed_dim
     log_step("Success", f"Encoder embed dimension: {embed_dim}")
@@ -486,9 +427,7 @@ def main() -> None:
     log_step("State Head", f"Creating StateHead (num_states={num_states})...")
     state_head = StateHead(embed_dim=embed_dim, num_states=num_states).to(device)
 
-    geo_head_type = args.geo_head_type
     if geo_head_type == "mixture":
-        num_components = args.mixture_components
         log_step(
             "Geo Head",
             f"Creating MixtureGeoHead (num_components={num_components}, "
@@ -504,7 +443,7 @@ def main() -> None:
         num_components = None
         log_step(
             "Geo Head",
-            f"Creating GeoHead (cell classification + residual, gps_loss={args.gps_loss})...",
+            f"Creating GeoHead (cell classification + residual, gps_loss={gps_loss_type})...",
         )
         geo_head = GeoHead(embed_dim=embed_dim, num_cells=len(centroids_np)).to(device)
 
@@ -584,26 +523,26 @@ def main() -> None:
     log_step(
         "Loss",
         "Creating loss functions with "
-        f"λ_state={args.lambda_state}, λ_cell={args.lambda_cell}, λ_gps={args.lambda_gps}",
+        f"λ_state={lambda_state}, λ_cell={lambda_cell}, λ_gps={lambda_gps}",
     )
-    log_step("", f"  State smoothing: {args.state_smoothing}")
+    log_step("", f"  State smoothing: {state_smoothing}")
     if geo_head_type == "mixture":
         log_step("", f"  Mixture cell aux: {mixture_use_cell_aux}")
         loss_fn = MixtureMultiTaskLoss(
-            state_smoothing=args.state_smoothing,
-            lambda_state=args.lambda_state,
-            lambda_cell=args.lambda_cell,
-            lambda_gps=args.lambda_gps,
+            state_smoothing=state_smoothing,
+            lambda_state=lambda_state,
+            lambda_cell=lambda_cell,
+            lambda_gps=lambda_gps,
             use_cell_aux=mixture_use_cell_aux,
         ).to(device)
     else:
-        log_step("", f"  GPS loss: {args.gps_loss}")
+        log_step("", f"  GPS loss: {gps_loss_type}")
         loss_fn = MultiTaskLoss(
-            state_smoothing=args.state_smoothing,
-            lambda_state=args.lambda_state,
-            lambda_cell=args.lambda_cell,
-            lambda_gps=args.lambda_gps,
-            gps_loss_type=args.gps_loss,
+            state_smoothing=state_smoothing,
+            lambda_state=lambda_state,
+            lambda_cell=lambda_cell,
+            lambda_gps=lambda_gps,
+            gps_loss_type=gps_loss_type,
         ).to(device)
     track_cell_loss = geo_head_type == "cell" or (
         geo_head_type == "mixture" and mixture_use_cell_aux
@@ -630,7 +569,7 @@ def main() -> None:
     # - Optional unfrozen encoder blocks: decayed LRs (base_lr * encoder_lr_scale * decay^(depth))
 
     base_lr = args.lr
-    lora_lr = base_lr * args.lora_lr_scale
+    lora_lr = base_lr * lora_lr_scale
 
     param_groups = []
     lora_param_ids = set()
@@ -680,7 +619,7 @@ def main() -> None:
         log_step("", f"  LoRA adapters: {len(lora_params)} params @ LR={lora_lr:.2e}")
 
     # Optional unfrozen encoder blocks with decay
-    if args.encoder_trainable_layers > 0:
+    if encoder_trainable_layers > 0:
         block_indices = encoder.get_trainable_block_indices()
         blocks = encoder.get_blocks()
         num_trainable = len(block_indices)
@@ -693,7 +632,7 @@ def main() -> None:
                 continue
             # deeper block (closer to output) gets higher LR
             decay_steps = num_trainable - depth_idx - 1
-            block_lr = base_lr * args.encoder_lr_scale * (args.encoder_llrd_decay**decay_steps)
+            block_lr = base_lr * encoder_lr_scale * (encoder_llrd_decay**decay_steps)
             param_groups.append(
                 {
                     "params": block_params,
@@ -778,11 +717,11 @@ def main() -> None:
                 )
                 raise ValueError("Checkpoint mixture configuration mismatch")
         else:
-            ckpt_gps_loss = ckpt_config.get("gps_loss", args.gps_loss)
-            if ckpt_gps_loss != args.gps_loss:
+            ckpt_gps_loss = ckpt_config.get("gps_loss", gps_loss_type)
+            if ckpt_gps_loss != gps_loss_type:
                 log_step(
                     "Error",
-                    f"GPS loss mismatch: checkpoint={ckpt_gps_loss}, current={args.gps_loss}",
+                    f"GPS loss mismatch: checkpoint={ckpt_gps_loss}, current={gps_loss_type}",
                     level="error",
                 )
                 raise ValueError("Checkpoint GPS loss mismatch")
@@ -986,15 +925,15 @@ def main() -> None:
                     "geo_head_type": geo_head_type,
                     "num_components": num_components if geo_head_type == "mixture" else None,
                     "use_cell_aux": mixture_use_cell_aux if geo_head_type == "mixture" else False,
-                    "gps_loss": args.gps_loss,
-                    "state_smoothing": args.state_smoothing,
-                    "lambda_state": args.lambda_state,
-                    "lambda_cell": args.lambda_cell,
-                    "lambda_gps": args.lambda_gps,
-                    "encoder_trainable_layers": args.encoder_trainable_layers,
-                    "encoder_lr_scale": args.encoder_lr_scale,
-                    "encoder_llrd_decay": args.encoder_llrd_decay,
-                    "lora_lr_scale": args.lora_lr_scale,
+                    "gps_loss": gps_loss_type,
+                    "state_smoothing": state_smoothing,
+                    "lambda_state": lambda_state,
+                    "lambda_cell": lambda_cell,
+                    "lambda_gps": lambda_gps,
+                    "encoder_trainable_layers": encoder_trainable_layers,
+                    "encoder_lr_scale": encoder_lr_scale,
+                    "encoder_llrd_decay": encoder_llrd_decay,
+                    "lora_lr_scale": lora_lr_scale,
                     "lora_rank": lora_rank,
                     "lora_alpha": lora_alpha,
                     "lora_layers": lora_layers,
