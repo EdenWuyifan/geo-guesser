@@ -97,7 +97,8 @@ def main() -> None:
         num_layers=2,
         num_heads=8,
         dropout=0.0,
-        use_cls_token=True,
+        use_global_token=True,
+        view_dropout_prob=0.0,  # Disable view dropout during inference
     )
     state_head = StateHead(embed_dim=embed_dim, num_states=num_states)
     geo_head = GeoHead(embed_dim=embed_dim, num_cells=args.num_cells)

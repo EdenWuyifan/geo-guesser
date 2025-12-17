@@ -21,6 +21,7 @@ from models.geo_geussr import (
 )
 
 from losses import MixtureMultiTaskLoss
+from self_supervised_losses import SelfSupervisedLoss
 
 from geo_cell import build_geo_cells
 
@@ -370,12 +371,16 @@ def main() -> None:
         "",
         f"  Layers: {args.fusion_layers}, Heads: {args.fusion_heads}, Dropout: {args.fusion_dropout}",
     )
+    # Enable view dropout for training robustness (drop 1-2 views randomly)
+    view_dropout_prob = 0.15  # 15% chance to drop views per sample
+    log_step("", f"  View dropout: {view_dropout_prob:.1%} (for training robustness)")
     fusion = DirectionalFusionTransformer(
         embed_dim=embed_dim,
         num_layers=args.fusion_layers,
         num_heads=args.fusion_heads,
         dropout=args.fusion_dropout,
-        use_cls_token=True,
+        use_global_token=True,
+        view_dropout_prob=view_dropout_prob,
     ).to(device)
 
     log_step("State Head", f"Creating StateHead (num_states={num_states})...")
@@ -482,6 +487,19 @@ def main() -> None:
         lambda_cell=0.5,
         lambda_gps=1.0,
         use_cell_aux=use_cell_aux,
+    ).to(device)
+
+    # Self-supervised losses for better geographic embedding space
+    log_step("Self-Supervised", "Creating SelfSupervisedLoss...")
+    log_step("", "  View consistency: λ=0.1 (4 views should be similar)")
+    log_step("", "  Geo-distance contrastive: λ=0.1 (nearby=positive, far=negative)")
+    self_sup_loss_fn = SelfSupervisedLoss(
+        lambda_view_consistency=0.1,
+        lambda_geo_distance=0.1,
+        view_temperature=0.07,
+        geo_temperature=0.07,
+        positive_threshold_km=100.0,
+        negative_threshold_km=1000.0,
     ).to(device)
 
     log_step("Optimizer", "Setting up layer-wise learning rate decay (LLRD)...")
@@ -675,7 +693,7 @@ def main() -> None:
             with autocast(device_type=dtype, enabled=(device.type == "cuda")):
                 out = model(images)
 
-                # Mixture-of-experts: use NLL loss directly on mixture
+                # Supervised loss: mixture-of-experts
                 loss_out = loss_fn(
                     state_logits=out.state.logits,
                     means=out.geo.means,
@@ -687,8 +705,19 @@ def main() -> None:
                     true_cell=true_cell,
                 )
 
+                # Self-supervised losses: view consistency + geo-distance contrastive
+                # Use view tokens from model output (no extra forward pass needed)
+                self_sup_losses = self_sup_loss_fn(
+                    view_tokens=out.view_tokens,  # (B, V=4, D)
+                    fused_embeddings=out.fused,  # (B, D)
+                    latlon=latlon,  # (B, 2)
+                )
+
+                # Combine supervised and self-supervised losses
+                total_loss = loss_out.total + self_sup_losses["total"]
+
             # Scale loss by accumulation steps for correct averaging
-            scaled_loss = loss_out.total / args.gradient_accumulation_steps
+            scaled_loss = total_loss / args.gradient_accumulation_steps
             scaler.scale(scaled_loss).backward()
 
             # Only step optimizer after accumulating gradients
@@ -702,7 +731,7 @@ def main() -> None:
             bs = len(images)
             # Accumulate on GPU (no CPU sync until logging) - massive speedup
             with torch.no_grad():
-                running_total += loss_out.total.detach() * bs
+                running_total += total_loss.detach() * bs
                 running_state += loss_out.parts["state"].detach() * bs
                 if "cell" in loss_out.parts:
                     running_cell += loss_out.parts["cell"].detach() * bs
@@ -734,6 +763,10 @@ def main() -> None:
             f"{Colors.BLUE}State:{Colors.END} {avg_state:.6f} | "
             f"{Colors.BLUE}Cell (aux):{Colors.END} {avg_cell:.6f} | "
             f"{Colors.BLUE}GPS (NLL):{Colors.END} {avg_gps:.6f}"
+        )
+        print(
+            f"  {Colors.CYAN}Note:{Colors.END} Total includes self-supervised losses "
+            f"(view consistency + geo-distance contrastive)"
         )
 
         log_step("Saving", f"Saving checkpoint for epoch {epoch}...")

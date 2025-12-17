@@ -185,6 +185,7 @@ class ModelOutput:
     state: StateHeadOutput
     geo: GeoHeadOutput | MixtureGeoHeadOutput
     fused: torch.Tensor  # (B, D)
+    view_tokens: torch.Tensor | None = None  # (B, V=4, D) for self-supervised losses
 
 
 class GeoGuessrModel(nn.Module):
@@ -209,4 +210,6 @@ class GeoGuessrModel(nn.Module):
         fus: FusionOutput = self.fusion(enc.embeddings)
         state = self.state_head(fus.fused)
         geo = self.geo_head(fus.fused)
-        return ModelOutput(state=state, geo=geo, fused=fus.fused)
+        return ModelOutput(
+            state=state, geo=geo, fused=fus.fused, view_tokens=enc.embeddings
+        )
