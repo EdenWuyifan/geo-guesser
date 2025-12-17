@@ -59,6 +59,8 @@ class DirectionalFusionTransformer(nn.Module):
         self.dir_pos_embed = nn.Parameter(torch.zeros(4, embed_dim))
         # Optional: learnable direction-specific scaling
         self.dir_scale = nn.Parameter(torch.ones(4))
+        # Mask token for dropped views (keeps scale stable vs zeroing)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
 
         # Global token (acts as query for cross-attention)
         if use_global_token:
@@ -101,42 +103,48 @@ class DirectionalFusionTransformer(nn.Module):
         nn.init.normal_(self.dir_scale, mean=1.0, std=0.02)
         if self.global_token is not None:
             nn.init.trunc_normal_(self.global_token, std=0.02)
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
 
     def _apply_view_dropout(
         self, view_tokens: torch.Tensor, training: bool
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Randomly drop 1-2 views during training for robustness.
-        Replaces dropped views with zero padding.
+        Replaces dropped views with a learned mask token and returns an attention mask.
 
         Args:
             view_tokens: (B, V=4, D)
             training: Whether in training mode
 
         Returns:
-            view_tokens with some views potentially zeroed out
+            view_tokens (with dropped views replaced) and a boolean mask (B, V) where True=masked
         """
         if not training or self.view_dropout_prob == 0.0:
-            return view_tokens
+            mask = torch.zeros(view_tokens.shape[:2], device=view_tokens.device, dtype=torch.bool)
+            return view_tokens, mask
 
         b, v, d = view_tokens.shape
         device = view_tokens.device
 
         # Create mask: each sample independently drops 1-2 views
-        mask = torch.ones(b, v, device=device, dtype=torch.bool)
+        mask = torch.zeros(b, v, device=device, dtype=torch.bool)
 
         for i in range(b):
             if torch.rand(1, device=device).item() < self.view_dropout_prob:
                 # Drop 1-2 views randomly
                 num_drop = torch.randint(1, 3, (1,), device=device).item()
                 drop_indices = torch.randperm(v, device=device)[:num_drop]
-                mask[i, drop_indices] = False
+                mask[i, drop_indices] = True
 
-        # Zero out dropped views
+        # Replace dropped views with mask token (noising)
         mask_expanded = mask.unsqueeze(-1)  # (B, V, 1)
-        view_tokens = view_tokens * mask_expanded
+        view_tokens = torch.where(
+            mask_expanded,
+            self.mask_token.expand_as(view_tokens),
+            view_tokens,
+        )
 
-        return view_tokens
+        return view_tokens, mask
 
     def forward(
         self, view_tokens: torch.Tensor, training: bool | None = None
@@ -157,7 +165,7 @@ class DirectionalFusionTransformer(nn.Module):
             raise ValueError(f"Expected V=4 views; got {v}")
 
         # Apply view dropout during training
-        view_tokens = self._apply_view_dropout(view_tokens, training)
+        view_tokens, attn_mask = self._apply_view_dropout(view_tokens, training)
 
         # Add learned directional positional embeddings with scaling
         # More expressive than simple addition
@@ -169,7 +177,7 @@ class DirectionalFusionTransformer(nn.Module):
         tokens = view_tokens + dir_embeds  # (B, 4, D)
 
         # Pass through transformer encoder for view interaction
-        enc_tokens = self.encoder(tokens)  # (B, 4, D)
+        enc_tokens = self.encoder(tokens, src_key_padding_mask=attn_mask)  # (B, 4, D)
         enc_tokens = self.norm(enc_tokens)
 
         # Cross-attention: global token attends to view tokens
@@ -181,6 +189,7 @@ class DirectionalFusionTransformer(nn.Module):
                 query=global_tok,
                 key=enc_tokens,
                 value=enc_tokens,
+                key_padding_mask=attn_mask,
             )  # (B, 1, D)
             fused = self.cross_attn_norm(attn_out.squeeze(1))  # (B, D)
         else:

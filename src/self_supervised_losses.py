@@ -7,69 +7,92 @@ import torch.nn.functional as F
 from losses import haversine_km
 
 
+def _masked_logsumexp(
+    x: torch.Tensor, mask: torch.Tensor, dim: int = -1
+) -> torch.Tensor:
+    """
+    Compute logsumexp over `x` along `dim`, masking out elements where mask is False.
+
+    mask: broadcastable to x, boolean.
+    """
+    neg_inf = torch.finfo(x.dtype).min
+    x_masked = x.masked_fill(~mask, neg_inf)
+    return torch.logsumexp(x_masked, dim=dim)
+
+
 class ViewConsistencyLoss(nn.Module):
     """
     Contrastive loss for view consistency: embeddings of 4 views from the same sample
     should be close; views from different samples should be far.
     """
 
-    def __init__(self, temperature: float = 0.07) -> None:
+    def __init__(self, temperature: float = 0.07, hard_negative_weight: float = 2.0) -> None:
         """
         Args:
             temperature: Temperature parameter for contrastive loss (lower = sharper)
+            hard_negative_weight: Multiplier for negatives from the same state (if provided)
         """
         super().__init__()
         self.temperature = temperature
+        self.hard_negative_weight = hard_negative_weight
 
     def forward(
-        self, view_tokens: torch.Tensor, sample_ids: torch.Tensor | None = None
+        self,
+        view_tokens: torch.Tensor,
+        state_class: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
             view_tokens: (B, V=4, D) embeddings for each view
-            sample_ids: (B,) optional sample IDs for hard negative mining (unused for now)
+            state_class: (B,) optional state class IDs to upweight hard negatives
 
         Returns:
             Contrastive loss scalar
         """
         B, V, D = view_tokens.shape
-        device = view_tokens.device
 
         # Normalize embeddings
         view_tokens = F.normalize(view_tokens, p=2, dim=-1)  # (B, V, D)
 
-        # Flatten to (B*V, D) for easier computation
-        views_flat = view_tokens.view(B * V, D)  # (B*V, D)
+        # Flatten to (N, D) where N=B*V
+        views_flat = view_tokens.reshape(B * V, D)  # (B*V, D)
+        sample_idx = torch.arange(B, device=view_tokens.device).repeat_interleave(V)  # (N,)
 
-        # Compute similarity matrix: (B*V, B*V)
-        similarity = (
-            torch.matmul(views_flat, views_flat.T) / self.temperature
-        )  # (B*V, B*V)
+        logits = torch.matmul(views_flat, views_flat.T) / self.temperature  # (N, N)
 
-        # Create positive mask: same sample (but different views)
-        pos_mask = torch.zeros(B * V, B * V, device=device, dtype=torch.bool)
-        for i in range(B):
-            start_idx = i * V
-            end_idx = (i + 1) * V
-            # All views from same sample are positives (excluding self)
-            pos_mask[start_idx:end_idx, start_idx:end_idx] = True
-            pos_mask[start_idx:end_idx, start_idx:end_idx].fill_diagonal_(False)
+        # Positives: same sample, different view
+        pos_mask = sample_idx[:, None] == sample_idx[None, :]
+        pos_mask.fill_diagonal_(False)
 
-        # InfoNCE loss: for each view, maximize similarity to positives
-        loss = 0.0
-        for i in range(B * V):
-            pos_indices = pos_mask[i].nonzero(as_tuple=False).squeeze(-1)
-            if len(pos_indices) == 0:
-                continue
+        # Valid comparisons: exclude self
+        valid_mask = torch.ones_like(pos_mask, dtype=torch.bool)
+        valid_mask.fill_diagonal_(False)
 
-            # Log-softmax over all similarities
-            log_probs = F.log_softmax(similarity[i], dim=0)  # (B*V,)
+        # Hard-negative weighting for negatives from same state (different sample)
+        if state_class is not None:
+            state_per_view = state_class.to(view_tokens.device)[sample_idx]  # (N,)
+            same_state = state_per_view[:, None] == state_per_view[None, :]
+            same_sample = sample_idx[:, None] == sample_idx[None, :]
+            hard_neg_mask = same_state & (~same_sample)
+            neg_weights = torch.ones_like(logits)
+            neg_weights = neg_weights + hard_neg_mask.to(logits.dtype) * (
+                float(self.hard_negative_weight) - 1.0
+            )
+        else:
+            neg_weights = torch.ones_like(logits)
 
-            # Sum log-probabilities of positive pairs
-            pos_log_probs = log_probs[pos_indices]
-            loss -= pos_log_probs.mean()
+        # Denominator weights apply to all non-self comparisons
+        denom_logits = logits + torch.log(neg_weights + 1e-8)
+        denom = _masked_logsumexp(denom_logits, valid_mask, dim=1)  # (N,)
 
-        return loss / (B * V) if B * V > 0 else torch.tensor(0.0, device=device)
+        # Multi-positive numerator: logsumexp over positives
+        has_pos = pos_mask.any(dim=1)
+        numerator = _masked_logsumexp(logits, pos_mask, dim=1)  # (N,)
+        loss = -(numerator - denom)
+        loss = loss.masked_fill(~has_pos, 0.0)
+
+        denom_count = has_pos.sum().clamp(min=1).to(loss.dtype)
+        return loss.sum() / denom_count
 
 
 class GeoDistanceContrastiveLoss(nn.Module):
@@ -84,6 +107,7 @@ class GeoDistanceContrastiveLoss(nn.Module):
         negative_threshold_km: float = 1000.0,
         temperature: float = 0.07,
         soft_weighting: bool = True,
+        hard_negative_weight: float = 2.0,
     ) -> None:
         """
         Args:
@@ -91,17 +115,20 @@ class GeoDistanceContrastiveLoss(nn.Module):
             negative_threshold_km: Distance threshold for negative pairs (km)
             temperature: Temperature parameter for contrastive loss
             soft_weighting: If True, use soft weights based on distance
+            hard_negative_weight: Multiplier for negatives from the same state (if provided)
         """
         super().__init__()
         self.positive_threshold_km = positive_threshold_km
         self.negative_threshold_km = negative_threshold_km
         self.temperature = temperature
         self.soft_weighting = soft_weighting
+        self.hard_negative_weight = hard_negative_weight
 
     def forward(
         self,
         embeddings: torch.Tensor,  # (B, D)
         latlon: torch.Tensor,  # (B, 2) [lat, lon] in degrees
+        state_class: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -112,7 +139,6 @@ class GeoDistanceContrastiveLoss(nn.Module):
             Contrastive loss scalar
         """
         B, D = embeddings.shape
-        device = embeddings.device
 
         # Normalize embeddings
         embeddings = F.normalize(embeddings, p=2, dim=-1)  # (B, D)
@@ -130,55 +156,43 @@ class GeoDistanceContrastiveLoss(nn.Module):
             B, B
         )  # (B, B)
 
-        # Compute similarity matrix
-        similarity = torch.matmul(embeddings, embeddings.T) / self.temperature  # (B, B)
+        logits = torch.matmul(embeddings, embeddings.T) / self.temperature  # (B, B)
+        valid_mask = torch.ones_like(logits, dtype=torch.bool)
+        valid_mask.fill_diagonal_(False)
 
-        # Create soft weights based on distance
+        # Positive weights based on distance (soft) or threshold (hard)
         if self.soft_weighting:
-            # Positive weight: higher for closer pairs, decays with distance
-            pos_weights = torch.exp(
-                -distances_km / self.positive_threshold_km
-            )  # (B, B)
-            pos_weights.fill_diagonal_(0)  # Exclude self
-
-            # Negative weight: higher for farther pairs
-            neg_weights = torch.clamp(
-                distances_km / self.negative_threshold_km, min=0.0, max=1.0
-            )  # (B, B)
-            neg_weights.fill_diagonal_(0)  # Exclude self
+            pos_weights = torch.exp(-distances_km / self.positive_threshold_km)  # (B, B)
         else:
-            # Hard thresholding
-            pos_mask = distances_km < self.positive_threshold_km
-            neg_mask = distances_km > self.negative_threshold_km
-            pos_weights = pos_mask.float()
-            neg_weights = neg_mask.float()
-            pos_weights.fill_diagonal_(0)
-            neg_weights.fill_diagonal_(0)
+            pos_weights = (distances_km < self.positive_threshold_km).to(logits.dtype)
+        pos_weights.fill_diagonal_(0.0)
 
-        # Contrastive loss: maximize similarity for positives, minimize for negatives
-        # Use InfoNCE-style loss: -log(exp(pos) / (exp(pos) + exp(neg)))
-        loss = 0.0
-        for i in range(B):
-            # Positive pairs (weighted)
-            pos_weight = pos_weights[i]  # (B,)
-            pos_mask = pos_weight > 1e-6
-            if pos_mask.sum() > 0:
-                # Weighted positive similarities
-                pos_sim = similarity[i] * pos_weight  # (B,)
-                pos_logsumexp = torch.logsumexp(pos_sim[pos_mask], dim=0)
-            else:
-                pos_logsumexp = torch.tensor(0.0, device=device)
+        # Denominator weighting: upweight hard negatives from same state (different sample)
+        if state_class is not None:
+            state_class = state_class.to(embeddings.device)
+            same_state = state_class[:, None] == state_class[None, :]
+            hard_neg_weights = torch.ones_like(logits)
+            hard_neg_weights = hard_neg_weights + same_state.to(logits.dtype) * (
+                float(self.hard_negative_weight) - 1.0
+            )
+        else:
+            hard_neg_weights = torch.ones_like(logits)
+        hard_neg_weights.fill_diagonal_(0.0)
 
-            # All other pairs (including negatives)
-            all_sim = similarity[i]  # (B,)
-            all_sim = all_sim.clone()
-            all_sim[i] = float("-inf")  # Exclude self
-            all_logsumexp = torch.logsumexp(all_sim, dim=0)
+        # Numerator: weighted multi-positive logsumexp
+        pos_mask = pos_weights > 1e-6
+        has_pos = pos_mask.any(dim=1)
+        numerator_logits = logits + torch.log(pos_weights + 1e-8)
+        numerator = _masked_logsumexp(numerator_logits, pos_mask, dim=1)  # (B,)
 
-            # InfoNCE: -log(exp(pos) / exp(all)) = -pos + all
-            loss += -pos_logsumexp + all_logsumexp
+        # Denominator: all non-self comparisons (with hard negative reweighting)
+        denom_logits = logits + torch.log(hard_neg_weights + 1e-8)
+        denom = _masked_logsumexp(denom_logits, valid_mask, dim=1)  # (B,)
 
-        return loss / B if B > 0 else torch.tensor(0.0, device=device)
+        loss = -(numerator - denom)
+        loss = loss.masked_fill(~has_pos, 0.0)
+        denom_count = has_pos.sum().clamp(min=1).to(loss.dtype)
+        return loss.sum() / denom_count
 
 
 class HardNegativeSampler:
@@ -295,6 +309,7 @@ class SelfSupervisedLoss(nn.Module):
         view_tokens: torch.Tensor,  # (B, V=4, D)
         fused_embeddings: torch.Tensor,  # (B, D)
         latlon: torch.Tensor,  # (B, 2)
+        state_class: torch.Tensor | None = None,  # (B,)
     ) -> dict[str, torch.Tensor]:
         """
         Compute self-supervised losses.
@@ -306,12 +321,14 @@ class SelfSupervisedLoss(nn.Module):
 
         # View consistency loss
         if self.lambda_view_consistency > 0:
-            view_loss = self.view_consistency_loss(view_tokens)
+            view_loss = self.view_consistency_loss(view_tokens, state_class=state_class)
             losses["view_consistency"] = view_loss
 
         # Geo-distance contrastive loss
         if self.lambda_geo_distance > 0:
-            geo_loss = self.geo_distance_loss(fused_embeddings, latlon)
+            geo_loss = self.geo_distance_loss(
+                fused_embeddings, latlon, state_class=state_class
+            )
             losses["geo_distance"] = geo_loss
 
         # Total self-supervised loss

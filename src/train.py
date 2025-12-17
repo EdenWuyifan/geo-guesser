@@ -17,10 +17,11 @@ from models.fusion_transformer import DirectionalFusionTransformer
 from models.geo_geussr import (
     GeoGuessrModel,
     StateHead,
+    GeoHead,
     MixtureGeoHead,
 )
 
-from losses import MixtureMultiTaskLoss
+from losses import MixtureMultiTaskLoss, MultiTaskLoss
 from self_supervised_losses import SelfSupervisedLoss
 
 from geo_cell import build_geo_cells
@@ -97,81 +98,161 @@ def find_latest_checkpoint(out_dir: Path) -> Path | None:
 def main() -> None:
     log_section("🌍 GeoGuessr Training Setup")
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data_dir", type=str, default="data")
-    ap.add_argument("--train_csv", type=str, default="train_ground_truth.csv")
-    ap.add_argument("--train_images", type=str, default="train_images")
-    ap.add_argument("--epochs", type=int, default=5)
-    ap.add_argument(
-        "--batch_size",
-        type=int,
-        default=256,
-        help="Batch size. Increase for higher GPU utilization (if memory allows).",
-    )
-    ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--num_cells", type=int, default=1)
-    ap.add_argument("--device", type=str, default="cuda")
-    ap.add_argument("--out_dir", type=str, default="checkpoints")
-    ap.add_argument("--seed", type=int, default=42)
+    def build_arg_parser() -> argparse.ArgumentParser:
+        ap = argparse.ArgumentParser()
 
-    # DINOv3 / mapping
-    ap.add_argument(
-        "--hf_model_id",
-        type=str,
-        default="facebook/dinov3-vit7b16-pretrain-lvd1689m",
-        help="HuggingFace model id for DINOv3. "
-        "Faster alternatives: 'facebook/dinov2-vitb14' (base), "
-        "'facebook/dinov2-vits14' (small, fastest)",
-    )
-    ap.add_argument(
-        "--compile_model",
-        type=str,
-        default="none",
-        choices=["none", "full", "heads"],
-        help="Compilation strategy: 'none' (default, recommended for debugging), "
-        "'full' (compile entire model), 'heads' (compile only trainable heads)",
-    )
-    ap.add_argument(
-        "--state_mapping",
-        type=str,
-        default="data/state_mapping.csv",
-        help="Path to state_mapping.csv (relative to repo root or absolute).",
-    )
-    ap.add_argument(
-        "--geo_method",
-        type=str,
-        default="kmeans3d",
-        choices=["s2", "kmeans3d"],
-        help="Method for building geo cells: 's2' or 'kmeans3d'.",
-    )
+        # Data / paths
+        ap.add_argument("--data_dir", type=str, default="data")
+        ap.add_argument("--train_csv", type=str, default="train_ground_truth.csv")
+        ap.add_argument("--train_images", type=str, default="train_images")
+        ap.add_argument("--state_mapping", type=str, default="data/state_mapping.csv")
+        ap.add_argument("--out_dir", type=str, default="checkpoints")
 
-    # Fusion
-    ap.add_argument("--fusion_layers", type=int, default=2)
-    ap.add_argument("--fusion_heads", type=int, default=8)
-    ap.add_argument("--fusion_dropout", type=float, default=0.1)
-    ap.add_argument(
-        "--num_workers",
-        type=int,
-        default=2,
-        help="Number of DataLoader workers (increase for faster data loading). "
-        "Recommended: 4-8 for most systems, higher if you have many CPU cores.",
-    )
-    ap.add_argument(
-        "--prefetch_factor",
-        type=int,
-        default=8,
-        help="DataLoader prefetch factor (higher = more prefetching). "
-        "Higher values keep GPU fed with data.",
-    )
-    ap.add_argument(
-        "--gradient_accumulation_steps",
-        type=int,
-        default=1,
-        help="Number of gradient accumulation steps. "
-        "Useful to simulate larger batch sizes when limited by GPU memory.",
-    )
+        # Training
+        ap.add_argument("--epochs", type=int, default=5)
+        ap.add_argument(
+            "--batch_size",
+            type=int,
+            default=256,
+            help="Batch size. Increase for higher GPU utilization (if memory allows).",
+        )
+        ap.add_argument("--lr", type=float, default=3e-4)
+        ap.add_argument(
+            "--gradient_accumulation_steps",
+            type=int,
+            default=1,
+            help="Number of gradient accumulation steps. "
+            "Useful to simulate larger batch sizes when limited by GPU memory.",
+        )
+        ap.add_argument("--seed", type=int, default=42)
+        ap.add_argument("--device", type=str, default="cuda")
 
+        # DINOv3 / mapping
+        ap.add_argument(
+            "--hf_model_id",
+            type=str,
+            default="facebook/dinov3-vit7b16-pretrain-lvd1689m",
+            help="HuggingFace model id for DINOv3. "
+            "Faster alternatives: 'facebook/dinov2-vitb14' (base), "
+            "'facebook/dinov2-vits14' (small, fastest)",
+        )
+        ap.add_argument(
+            "--compile_model",
+            type=str,
+            default="none",
+            choices=["none", "full", "heads"],
+            help="Compilation strategy: 'none' (default, recommended for debugging), "
+            "'full' (compile entire model), 'heads' (compile only trainable heads)",
+        )
+        ap.add_argument(
+            "--geo_method",
+            type=str,
+            default="kmeans3d",
+            choices=["s2", "kmeans3d"],
+            help="Method for building geo cells: 's2' or 'kmeans3d'.",
+        )
+
+        # Fusion
+        ap.add_argument("--fusion_layers", type=int, default=2)
+        ap.add_argument("--fusion_heads", type=int, default=8)
+        ap.add_argument("--fusion_dropout", type=float, default=0.1)
+        ap.add_argument(
+            "--num_workers",
+            type=int,
+            default=2,
+            help="Number of DataLoader workers (increase for faster data loading). "
+            "Recommended: 4-8 for most systems, higher if you have many CPU cores.",
+        )
+        ap.add_argument(
+            "--prefetch_factor",
+            type=int,
+            default=8,
+            help="DataLoader prefetch factor (higher = more prefetching). "
+            "Higher values keep GPU fed with data.",
+        )
+
+        # Encoder finetuning (LoRA + partial unfreeze)
+        ap.add_argument(
+            "--encoder_trainable_layers",
+            type=int,
+            default=2,
+            help="Unfreeze last N transformer blocks of DINOv3 (0 = keep frozen).",
+        )
+        ap.add_argument(
+            "--encoder_lr_scale",
+            type=float,
+            default=0.1,
+            help="Base LR multiplier for unfrozen encoder blocks (before LLRD).",
+        )
+        ap.add_argument(
+            "--encoder_llrd_decay",
+            type=float,
+            default=0.8,
+            help="Layer-wise LR decay for unfrozen encoder blocks (closer to head = higher LR).",
+        )
+        ap.add_argument(
+            "--lora_lr_scale",
+            type=float,
+            default=0.1,
+            help="LR multiplier for LoRA adapters relative to --lr.",
+        )
+
+        # Geo head / loss configuration (mixture default)
+        ap.add_argument(
+            "--geo_head_type",
+            type=str,
+            default="mixture",
+            choices=["mixture", "cell"],
+            help="Geo regression head type: mixture (default) or cell (classification + residual).",
+        )
+        ap.add_argument(
+            "--mixture_components",
+            type=int,
+            default=5,
+            help="Number of mixture components when geo_head_type='mixture'.",
+        )
+        ap.add_argument(
+            "--no_mixture_cell_aux",
+            action="store_true",
+            help="Disable auxiliary cell classification loss for the mixture head.",
+        )
+        ap.add_argument(
+            "--state_smoothing",
+            type=float,
+            default=0.1,
+            help="Label smoothing for the state classification head.",
+        )
+        ap.add_argument(
+            "--lambda_state",
+            type=float,
+            default=1.0,
+            help="Weight for the state classification loss.",
+        )
+        ap.add_argument(
+            "--lambda_cell",
+            type=float,
+            default=0.5,
+            help="Weight for the geo cell loss (primary for cell head, auxiliary for mixture).",
+        )
+        ap.add_argument(
+            "--lambda_gps",
+            type=float,
+            default=1.0,
+            help="Weight for the GPS regression / mixture NLL loss.",
+        )
+        ap.add_argument(
+            "--gps_loss",
+            type=str,
+            default="haversine",
+            choices=["haversine", "huber"],
+            help="GPS regression loss type when using geo_head_type='cell'.",
+        )
+
+        return ap
+
+    ap = build_arg_parser()
     args = ap.parse_args()
+    mixture_use_cell_aux = not args.no_mixture_cell_aux
 
     log_step("Configuration", "Parsing arguments...")
     log_step("", f"  Data directory: {args.data_dir}")
@@ -182,6 +263,21 @@ def main() -> None:
     log_step("", f"  Learning rate: {args.lr}")
     log_step("", f"  Number of cells: {args.num_cells}")
     log_step("", f"  Geo method: {args.geo_method}")
+    log_step(
+        "",
+        f"  Geo head: {args.geo_head_type}"
+        + (
+            f" (K={args.mixture_components}, cell_aux={mixture_use_cell_aux})"
+            if args.geo_head_type == "mixture"
+            else f" (gps_loss={args.gps_loss})"
+        ),
+    )
+    log_step(
+        "",
+        f"  Encoder finetune: last {args.encoder_trainable_layers} blocks "
+        f"(lr_scale={args.encoder_lr_scale}, decay={args.encoder_llrd_decay})",
+    )
+    log_step("", f"  LoRA lr scale: {args.lora_lr_scale}")
     log_step("", f"  Output directory: {args.out_dir}")
     log_step("", f"  Seed: {args.seed}")
 
@@ -309,6 +405,7 @@ def main() -> None:
 
     # Pre-allocate cell_ids tensor on GPU for faster batch lookup (using row_idx from dataset)
     cell_ids_tensor = torch.from_numpy(cell_ids_np).to(device)
+    centroids_tensor = torch.from_numpy(centroids_np).to(device=device, dtype=torch.float32)
     log_step("Pre-allocation", "Pre-allocated cell_ids tensor on GPU")
 
     log_step("Saving", "Saving geo cell data...")
@@ -332,15 +429,24 @@ def main() -> None:
     )
     encoder = DinoV3Encoder(
         model_id=args.hf_model_id,
-        freeze=True,  # Freeze base weights, only LoRA params trainable
+        freeze=True,  # Start frozen; optionally unfreeze last blocks below
         torch_dtype=torch_dtype,
         use_lora=True,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         lora_layers=lora_layers,
+        trainable_layers=args.encoder_trainable_layers,
     ).to(device)
     embed_dim = encoder.embed_dim
     log_step("Success", f"Encoder embed dimension: {embed_dim}")
+    trainable_blocks = encoder.get_trainable_block_indices()
+    if trainable_blocks:
+        log_step(
+            "Encoder",
+            f"Unfrozen last {len(trainable_blocks)} blocks (indices: {trainable_blocks})",
+        )
+    else:
+        log_step("Encoder", "Backbone frozen (only LoRA adapters trainable)")
 
     # Warn if using a very large model
     if "7b" in args.hf_model_id.lower() or "giant" in args.hf_model_id.lower():
@@ -380,20 +486,27 @@ def main() -> None:
     log_step("State Head", f"Creating StateHead (num_states={num_states})...")
     state_head = StateHead(embed_dim=embed_dim, num_states=num_states).to(device)
 
-    # Default: use mixture-of-experts regression (5 components, with cell aux loss)
-    num_components = 5
-    use_cell_aux = True
-    log_step(
-        "Geo Head",
-        f"Creating MixtureGeoHead (num_components={num_components}, "
-        f"use_cell_aux={use_cell_aux})...",
-    )
-    geo_head = MixtureGeoHead(
-        embed_dim=embed_dim,
-        num_components=num_components,
-        use_cell_aux=use_cell_aux,
-        num_cells=len(centroids_np),
-    ).to(device)
+    geo_head_type = args.geo_head_type
+    if geo_head_type == "mixture":
+        num_components = args.mixture_components
+        log_step(
+            "Geo Head",
+            f"Creating MixtureGeoHead (num_components={num_components}, "
+            f"use_cell_aux={mixture_use_cell_aux})...",
+        )
+        geo_head = MixtureGeoHead(
+            embed_dim=embed_dim,
+            num_components=num_components,
+            use_cell_aux=mixture_use_cell_aux,
+            num_cells=len(centroids_np) if mixture_use_cell_aux else None,
+        ).to(device)
+    else:
+        num_components = None
+        log_step(
+            "Geo Head",
+            f"Creating GeoHead (cell classification + residual, gps_loss={args.gps_loss})...",
+        )
+        geo_head = GeoHead(embed_dim=embed_dim, num_cells=len(centroids_np)).to(device)
 
     log_step("Assembling", "Assembling GeoGuessrModel...")
     model = GeoGuessrModel(
@@ -468,20 +581,33 @@ def main() -> None:
 
     log_section("⚙️  Training Setup")
 
-    log_step("Loss", "Creating MixtureMultiTaskLoss...")
     log_step(
-        "",
-        f"  State smoothing: 0.1, λ_state: 1.0, λ_gps: 1.0, "
-        f"use_cell_aux: {use_cell_aux}",
+        "Loss",
+        "Creating loss functions with "
+        f"λ_state={args.lambda_state}, λ_cell={args.lambda_cell}, λ_gps={args.lambda_gps}",
     )
-    log_step("", "  λ_cell: 0.5 (auxiliary loss)")
-    loss_fn = MixtureMultiTaskLoss(
-        state_smoothing=0.1,
-        lambda_state=1.0,
-        lambda_cell=0.5,
-        lambda_gps=1.0,
-        use_cell_aux=use_cell_aux,
-    ).to(device)
+    log_step("", f"  State smoothing: {args.state_smoothing}")
+    if geo_head_type == "mixture":
+        log_step("", f"  Mixture cell aux: {mixture_use_cell_aux}")
+        loss_fn = MixtureMultiTaskLoss(
+            state_smoothing=args.state_smoothing,
+            lambda_state=args.lambda_state,
+            lambda_cell=args.lambda_cell,
+            lambda_gps=args.lambda_gps,
+            use_cell_aux=mixture_use_cell_aux,
+        ).to(device)
+    else:
+        log_step("", f"  GPS loss: {args.gps_loss}")
+        loss_fn = MultiTaskLoss(
+            state_smoothing=args.state_smoothing,
+            lambda_state=args.lambda_state,
+            lambda_cell=args.lambda_cell,
+            lambda_gps=args.lambda_gps,
+            gps_loss_type=args.gps_loss,
+        ).to(device)
+    track_cell_loss = geo_head_type == "cell" or (
+        geo_head_type == "mixture" and mixture_use_cell_aux
+    )
 
     # Self-supervised losses for better geographic embedding space
     log_step("Self-Supervised", "Creating SelfSupervisedLoss...")
@@ -500,14 +626,14 @@ def main() -> None:
 
     # Layer-wise learning rate decay strategy:
     # - Heads & Fusion: high LR (base_lr)
-    # - Last blocks (LoRA): medium LR (base_lr * 0.1)
-    # - Earlier blocks: frozen (LR = 0, but handled by freeze=True)
+    # - LoRA adapters: medium LR (base_lr * lora_lr_scale)
+    # - Optional unfrozen encoder blocks: decayed LRs (base_lr * encoder_lr_scale * decay^(depth))
 
     base_lr = args.lr
-    lora_lr = base_lr * 0.1  # 10x smaller for LoRA adapters
+    lora_lr = base_lr * args.lora_lr_scale
 
-    # Group parameters by component
     param_groups = []
+    lora_param_ids = set()
 
     # Heads and fusion: high LR
     head_fusion_params = []
@@ -541,6 +667,7 @@ def main() -> None:
     for name, param in model.named_parameters():
         if "lora" in name.lower() and param.requires_grad:
             lora_params.append(param)
+            lora_param_ids.add(id(param))
 
     if lora_params:
         param_groups.append(
@@ -551,6 +678,33 @@ def main() -> None:
             }
         )
         log_step("", f"  LoRA adapters: {len(lora_params)} params @ LR={lora_lr:.2e}")
+
+    # Optional unfrozen encoder blocks with decay
+    if args.encoder_trainable_layers > 0:
+        block_indices = encoder.get_trainable_block_indices()
+        blocks = encoder.get_blocks()
+        num_trainable = len(block_indices)
+        for depth_idx, block_idx in enumerate(block_indices):
+            block = blocks[block_idx]
+            block_params = [
+                p for p in block.parameters() if p.requires_grad and id(p) not in lora_param_ids
+            ]
+            if not block_params:
+                continue
+            # deeper block (closer to output) gets higher LR
+            decay_steps = num_trainable - depth_idx - 1
+            block_lr = base_lr * args.encoder_lr_scale * (args.encoder_llrd_decay**decay_steps)
+            param_groups.append(
+                {
+                    "params": block_params,
+                    "lr": block_lr,
+                    "name": f"encoder_block_{block_idx}",
+                }
+            )
+            log_step(
+                "",
+                f"  Encoder block {block_idx}: {len(block_params)} params @ LR={block_lr:.2e}",
+            )
 
     # Create optimizer with parameter groups
     optim = torch.optim.AdamW(
@@ -582,37 +736,56 @@ def main() -> None:
                 "num_states": ckpt.get("num_states"),
                 "use_mixture": ckpt.get("use_mixture", True),
                 "num_components": ckpt.get("num_components", num_components),
-                "use_cell_aux": ckpt.get("use_cell_aux", use_cell_aux),
+                "use_cell_aux": ckpt.get("use_cell_aux", mixture_use_cell_aux),
             }
 
         ckpt_embed_dim = ckpt_config.get("embed_dim")
         ckpt_num_states = ckpt_config.get("num_states")
-        ckpt_use_mixture = ckpt_config.get("use_mixture", True)
+        ckpt_use_mixture = ckpt_config.get("use_mixture", geo_head_type == "mixture")
+        ckpt_geo_type = ckpt_config.get(
+            "geo_head_type", "mixture" if ckpt_use_mixture else "cell"
+        )
 
         if (
             ckpt_embed_dim != embed_dim
             or ckpt_num_states != num_states
-            or ckpt_use_mixture is not True
+            or ckpt_geo_type != geo_head_type
         ):
             log_step(
                 "Error",
                 f"Checkpoint incompatible: embed_dim={ckpt_embed_dim} vs {embed_dim}, "
                 f"num_states={ckpt_num_states} vs {num_states}, "
-                f"use_mixture={ckpt_use_mixture} vs True",
+                f"geo_head_type={ckpt_geo_type} vs {geo_head_type}",
                 level="error",
             )
             raise ValueError("Checkpoint configuration mismatch")
 
-        ckpt_num_components = ckpt_config.get("num_components", num_components)
-        ckpt_use_cell_aux = ckpt_config.get("use_cell_aux", use_cell_aux)
-        if ckpt_num_components != num_components or ckpt_use_cell_aux != use_cell_aux:
-            log_step(
-                "Error",
-                f"Mixture model mismatch: num_components={ckpt_num_components} vs {num_components}, "
-                f"use_cell_aux={ckpt_use_cell_aux} vs {use_cell_aux}",
-                level="error",
+        if geo_head_type == "mixture":
+            ckpt_num_components = ckpt_config.get("num_components", num_components)
+            ckpt_use_cell_aux = ckpt_config.get(
+                "use_cell_aux", mixture_use_cell_aux
             )
-            raise ValueError("Checkpoint mixture configuration mismatch")
+            if (
+                ckpt_num_components != num_components
+                or ckpt_use_cell_aux != mixture_use_cell_aux
+            ):
+                log_step(
+                    "Error",
+                    "Mixture model mismatch: "
+                    f"num_components={ckpt_num_components} vs {num_components}, "
+                    f"use_cell_aux={ckpt_use_cell_aux} vs {mixture_use_cell_aux}",
+                    level="error",
+                )
+                raise ValueError("Checkpoint mixture configuration mismatch")
+        else:
+            ckpt_gps_loss = ckpt_config.get("gps_loss", args.gps_loss)
+            if ckpt_gps_loss != args.gps_loss:
+                log_step(
+                    "Error",
+                    f"GPS loss mismatch: checkpoint={ckpt_gps_loss}, current={args.gps_loss}",
+                    level="error",
+                )
+                raise ValueError("Checkpoint GPS loss mismatch")
 
         # Load model state
         model.load_state_dict(ckpt["model"], strict=True)
@@ -696,17 +869,32 @@ def main() -> None:
             with autocast(device_type=dtype, enabled=(device.type == "cuda")):
                 out = model(images)
 
-                # Supervised loss: mixture-of-experts
-                loss_out = loss_fn(
-                    state_logits=out.state.logits,
-                    means=out.geo.means,
-                    covariances=out.geo.covariances,
-                    weights=out.geo.weights,
-                    true_state=state_class,
-                    true_latlon=latlon,
-                    cell_logits=out.geo.cell_logits,
-                    true_cell=true_cell,
-                )
+                if geo_head_type == "mixture":
+                    cell_logits = out.geo.cell_logits if mixture_use_cell_aux else None
+                    true_cell_arg = true_cell if mixture_use_cell_aux else None
+                    loss_out = loss_fn(
+                        state_logits=out.state.logits,
+                        means=out.geo.means,
+                        covariances=out.geo.covariances,
+                        weights=out.geo.weights,
+                        true_state=state_class,
+                        true_latlon=latlon,
+                        cell_logits=cell_logits,
+                        true_cell=true_cell_arg,
+                    )
+                else:
+                    expected_centroid = torch.matmul(
+                        out.geo.cell_probs.float(), centroids_tensor.float()
+                    )
+                    pred_latlon = expected_centroid + out.geo.residual.float()
+                    loss_out = loss_fn(
+                        state_logits=out.state.logits,
+                        cell_logits=out.geo.cell_logits,
+                        pred_latlon=pred_latlon,
+                        true_state=state_class,
+                        true_cell=true_cell,
+                        true_latlon=latlon,
+                    )
 
                 # Self-supervised losses: view consistency + geo-distance contrastive
                 # Use view tokens from model output (no extra forward pass needed)
@@ -714,6 +902,7 @@ def main() -> None:
                     view_tokens=out.view_tokens,  # (B, V=4, D)
                     fused_embeddings=out.fused,  # (B, D)
                     latlon=latlon,  # (B, 2)
+                    state_class=state_class,  # (B,)
                 )
 
                 # Combine supervised and self-supervised losses
@@ -758,15 +947,17 @@ def main() -> None:
         # Epoch summary (sync GPU->CPU only once at epoch end)
         avg_total = (running_total / seen).item()
         avg_state = (running_state / seen).item()
-        avg_cell = (running_cell / seen).item()
+        avg_cell = (running_cell / seen).item() if track_cell_loss else None
         avg_gps = (running_gps / seen).item()
         print(f"\n{Colors.BOLD}Epoch {epoch} Summary:{Colors.END}")
-        print(
+        summary = (
             f"  {Colors.GREEN}Total Loss:{Colors.END} {avg_total:.6f} | "
-            f"{Colors.BLUE}State:{Colors.END} {avg_state:.6f} | "
-            f"{Colors.BLUE}Cell (aux):{Colors.END} {avg_cell:.6f} | "
-            f"{Colors.BLUE}GPS (NLL):{Colors.END} {avg_gps:.6f}"
+            f"{Colors.BLUE}State:{Colors.END} {avg_state:.6f}"
         )
+        if track_cell_loss and avg_cell is not None:
+            summary += f" | {Colors.BLUE}Cell:{Colors.END} {avg_cell:.6f}"
+        summary += f" | {Colors.BLUE}GPS:{Colors.END} {avg_gps:.6f}"
+        print(summary)
         print(
             f"  {Colors.CYAN}Note:{Colors.END} Total includes self-supervised losses "
             f"(view consistency + geo-distance contrastive)"
@@ -791,9 +982,22 @@ def main() -> None:
                     "embed_dim": embed_dim,
                     "num_states": num_states,
                     "num_cells": len(centroids_np),
-                    "use_mixture": True,
-                    "num_components": num_components,
-                    "use_cell_aux": use_cell_aux,
+                    "use_mixture": geo_head_type == "mixture",
+                    "geo_head_type": geo_head_type,
+                    "num_components": num_components if geo_head_type == "mixture" else None,
+                    "use_cell_aux": mixture_use_cell_aux if geo_head_type == "mixture" else False,
+                    "gps_loss": args.gps_loss,
+                    "state_smoothing": args.state_smoothing,
+                    "lambda_state": args.lambda_state,
+                    "lambda_cell": args.lambda_cell,
+                    "lambda_gps": args.lambda_gps,
+                    "encoder_trainable_layers": args.encoder_trainable_layers,
+                    "encoder_lr_scale": args.encoder_lr_scale,
+                    "encoder_llrd_decay": args.encoder_llrd_decay,
+                    "lora_lr_scale": args.lora_lr_scale,
+                    "lora_rank": lora_rank,
+                    "lora_alpha": lora_alpha,
+                    "lora_layers": lora_layers,
                     "geo_method": args.geo_method,
                     "fusion_layers": args.fusion_layers,
                     "fusion_heads": args.fusion_heads,

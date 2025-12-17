@@ -100,6 +100,14 @@ def add_lora_to_attention(
                 q_proj.bias.copy_(qkv.bias[:dim])
                 v_proj.bias.copy_(qkv.bias[2 * dim :])
 
+        # Freeze base projections by default; LoRA layers hold trainable params
+        for p in q_proj.parameters():
+            p.requires_grad = False
+        for p in k_proj.parameters():
+            p.requires_grad = False
+        for p in v_proj.parameters():
+            p.requires_grad = False
+
         # Replace with LoRA versions for q and v
         if "q" in target_modules:
             attn_module.q_proj = LoRALinear(q_proj, rank=rank, alpha=alpha)

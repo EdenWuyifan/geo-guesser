@@ -35,6 +35,7 @@ class DinoV3Encoder(nn.Module):
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
         lora_layers: int = 4,
+        trainable_layers: int = 0,
     ) -> None:
         """
         Args:
@@ -45,6 +46,7 @@ class DinoV3Encoder(nn.Module):
             lora_rank: LoRA rank (r)
             lora_alpha: LoRA scaling factor
             lora_layers: Number of last transformer blocks to add LoRA to
+            trainable_layers: Unfreeze this many final transformer blocks (in addition to LoRA)
         """
         super().__init__()
         self.model_id = model_id
@@ -52,6 +54,7 @@ class DinoV3Encoder(nn.Module):
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_layers = lora_layers
+        self.trainable_layers = trainable_layers
 
         self.config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         self.backbone = AutoModel.from_pretrained(
@@ -68,11 +71,16 @@ class DinoV3Encoder(nn.Module):
         if self.embed_dim is None:
             raise ValueError("Could not infer embed_dim from model config.")
 
+        self._blocks = self._find_blocks()
+        self.trainable_block_indices: list[int] = []
+
         if freeze:
             self.freeze_backbone()
 
         if use_lora:
             self._add_lora_adapters()
+        if trainable_layers > 0:
+            self.unfreeze_last_blocks(trainable_layers)
 
     @staticmethod
     def processor_params(model_id: str) -> dict:
@@ -96,10 +104,8 @@ class DinoV3Encoder(nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad = True
 
-    def _add_lora_adapters(self) -> None:
-        """Add LoRA adapters to the last N transformer blocks."""
-        # Find transformer blocks in the backbone
-        # DINOv3 typically has .encoder.blocks or .vit.encoder.layer
+    def _find_blocks(self) -> nn.ModuleList:
+        """Locate transformer blocks ModuleList."""
         blocks = None
         if hasattr(self.backbone, "encoder") and hasattr(
             self.backbone.encoder, "blocks"
@@ -126,12 +132,40 @@ class DinoV3Encoder(nn.Module):
                 "Please check the model architecture."
             )
 
-        num_blocks = len(blocks)
+        return blocks
+
+    def get_blocks(self) -> nn.ModuleList:
+        return self._blocks
+
+    def get_num_blocks(self) -> int:
+        return len(self._blocks)
+
+    def unfreeze_last_blocks(self, num_layers: int) -> None:
+        """Unfreeze the last `num_layers` transformer blocks."""
+        if num_layers <= 0:
+            self.trainable_block_indices = []
+            return
+
+        num_blocks = len(self._blocks)
+        start_idx = max(0, num_blocks - num_layers)
+        self.trainable_block_indices = list(range(start_idx, num_blocks))
+
+        for i in self.trainable_block_indices:
+            for p in self._blocks[i].parameters():
+                p.requires_grad = True
+
+    def get_trainable_block_indices(self) -> list[int]:
+        """Return indices of blocks that were unfrozen via unfreeze_last_blocks."""
+        return getattr(self, "trainable_block_indices", [])
+
+    def _add_lora_adapters(self) -> None:
+        """Add LoRA adapters to the last N transformer blocks."""
+        num_blocks = len(self._blocks)
         start_idx = max(0, num_blocks - self.lora_layers)
 
         # Add LoRA to last N blocks
         for i in range(start_idx, num_blocks):
-            block = blocks[i]
+            block = self._blocks[i]
             # Find attention module
             attn = None
             if hasattr(block, "attn"):

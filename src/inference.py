@@ -59,9 +59,13 @@ def main() -> None:
     embed_dim = config["embed_dim"]
     num_states = config["num_states"]
     num_cells = config["num_cells"]
-    use_mixture = config.get("use_mixture", True)
+    use_mixture_flag = config.get("use_mixture", True)
+    geo_head_type = config.get(
+        "geo_head_type", "mixture" if use_mixture_flag else "cell"
+    )
+    use_mixture = geo_head_type == "mixture"
     num_components = config.get("num_components", 5)
-    use_cell_aux = config.get("use_cell_aux", True)
+    use_cell_aux = config.get("use_cell_aux", True if use_mixture else False)
     fusion_layers = config.get("fusion_layers", 2)
     fusion_heads = config.get("fusion_heads", 8)
     fusion_dropout = config.get("fusion_dropout", 0.1)
@@ -80,6 +84,9 @@ def main() -> None:
 
     print(f"Loading geo cell centroids from: {centroids_path}")
     centroids = np.load(centroids_path)  # (num_cells, 2)
+    centroids_tensor = torch.tensor(
+        centroids, device=device, dtype=torch.float32
+    )  # used for cell head expectation
 
     # Setup data paths
     data_dir = Path(args.data_dir)
@@ -204,12 +211,11 @@ def main() -> None:
                 .numpy()
             )  # (B, 2)
         else:
-            # Old model: centroid(top cell) + residual
-            top_cell = out.geo.cell_probs.argmax(dim=-1).cpu().numpy()  # (B,)
-            centroid = torch.tensor(
-                centroids[top_cell], device=device, dtype=torch.float32
+            # Cell head: expectation over centroids + residual
+            expected_centroid = torch.matmul(
+                out.geo.cell_probs.float(), centroids_tensor
             )  # (B,2)
-            pred_latlon = (centroid + out.geo.residual).cpu().numpy()  # (B,2)
+            pred_latlon = (expected_centroid + out.geo.residual.float()).cpu().numpy()
 
         all_ids.append(sample_id)
         all_state_top5_idx.append(top5_state_idx)

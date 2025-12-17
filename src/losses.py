@@ -110,15 +110,44 @@ class MixtureNLLLoss(nn.Module):
         true_latlon_f32 = true_latlon.float()
         weights_f32 = weights.float()
 
+        # Ensure positive definiteness: add regularization to diagonal
+        # This is a safety measure in case some matrices are still problematic
+        min_eigenvalue = 1e-4
+        identity = torch.eye(
+            2, device=covariances_f32.device, dtype=covariances_f32.dtype
+        ).unsqueeze(
+            0
+        )  # (1, 2, 2)
+        # Add regularization to all covariance matrices at once
+        covariances_f32 = (
+            covariances_f32 + identity.unsqueeze(0) * min_eigenvalue
+        )  # (B, K, 2, 2)
+
         # Compute log-probability for each mixture component
         log_probs = []
         for k in range(K):
-            comp_dist = MultivariateNormal(
-                loc=means_f32[:, k, :],  # (B, 2)
-                covariance_matrix=covariances_f32[:, k, :, :],  # (B, 2, 2)
-            )
-            log_prob_k = comp_dist.log_prob(true_latlon_f32)  # (B,)
-            log_probs.append(log_prob_k)
+            try:
+                comp_dist = MultivariateNormal(
+                    loc=means_f32[:, k, :],  # (B, 2)
+                    covariance_matrix=covariances_f32[:, k, :, :],  # (B, 2, 2)
+                )
+                log_prob_k = comp_dist.log_prob(true_latlon_f32)  # (B,)
+                log_probs.append(log_prob_k)
+            except Exception:
+                # Fallback: use diagonal approximation if full covariance fails
+                cov_k = covariances_f32[:, k, :, :]  # (B, 2, 2)
+                # Extract diagonal and ensure positive
+                diag = torch.diagonal(cov_k, dim1=-2, dim2=-1)  # (B, 2)
+                diag = torch.clamp(diag, min=min_eigenvalue)
+                # Use independent Gaussians as fallback
+                from torch.distributions import Normal
+
+                dist_lat = Normal(means_f32[:, k, 0], torch.sqrt(diag[:, 0]))
+                dist_lon = Normal(means_f32[:, k, 1], torch.sqrt(diag[:, 1]))
+                log_prob_k = dist_lat.log_prob(
+                    true_latlon_f32[:, 0]
+                ) + dist_lon.log_prob(true_latlon_f32[:, 1])
+                log_probs.append(log_prob_k)
 
         # Stack: (B, K)
         log_probs_stack = torch.stack(log_probs, dim=1)

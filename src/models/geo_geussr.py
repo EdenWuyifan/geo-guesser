@@ -94,7 +94,7 @@ class MixtureGeoHead(nn.Module):
         num_components: int = 5,
         use_cell_aux: bool = False,
         num_cells: int | None = None,
-        min_cov: float = 1e-4,
+        min_cov: float = 1e-3,
     ) -> None:
         """
         Args:
@@ -154,9 +154,10 @@ class MixtureGeoHead(nn.Module):
 
         # Build positive-definite covariance matrices from lower triangular
         # L = [[L11, 0], [L21, L22]] -> Cov = L @ L.T
-        L11 = torch.clamp(cov_params[:, :, 0], min=self.min_cov)  # (B, K)
+        # Use softplus to ensure positive diagonal elements
+        L11 = torch.nn.functional.softplus(cov_params[:, :, 0]) + self.min_cov  # (B, K)
         L21 = cov_params[:, :, 1]  # (B, K)
-        L22 = torch.clamp(cov_params[:, :, 2], min=self.min_cov)  # (B, K)
+        L22 = torch.nn.functional.softplus(cov_params[:, :, 2]) + self.min_cov  # (B, K)
 
         # Construct lower triangular matrices
         L = torch.zeros(B, K, 2, 2, device=fused.device, dtype=fused.dtype)
@@ -166,6 +167,15 @@ class MixtureGeoHead(nn.Module):
 
         # Compute covariance: Cov = L @ L.T
         covariances = L @ L.transpose(-2, -1)  # (B, K, 2, 2)
+
+        # Add regularization to diagonal to ensure positive definiteness
+        # This helps with numerical stability - use larger value for safety
+        identity = (
+            torch.eye(2, device=fused.device, dtype=fused.dtype)
+            .unsqueeze(0)
+            .unsqueeze(0)
+        )  # (1, 1, 2, 2)
+        covariances = covariances + identity * (self.min_cov * 10)  # (B, K, 2, 2)
 
         # Optional: cell classification for auxiliary loss
         cell_logits = None
