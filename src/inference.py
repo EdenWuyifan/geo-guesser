@@ -115,9 +115,13 @@ def main() -> None:
     model.load_state_dict(state_dict, strict=True)
     model.eval()
 
-    # Prepare output rows using the provided template
-    template = pd.read_csv(test_csv)
-    for col in [
+    # Required columns for submission
+    required_cols = [
+        "sample_id",
+        "image_north",
+        "image_east",
+        "image_south",
+        "image_west",
         "predicted_state_idx_1",
         "predicted_state_idx_2",
         "predicted_state_idx_3",
@@ -125,9 +129,10 @@ def main() -> None:
         "predicted_state_idx_5",
         "predicted_latitude",
         "predicted_longitude",
-    ]:
-        if col not in template.columns:
-            template[col] = np.nan
+    ]
+
+    # Read template to get sample_id and image paths
+    template = pd.read_csv(test_csv)
 
     all_ids: List[np.ndarray] = []
     all_state_top5_idx: List[np.ndarray] = []
@@ -142,7 +147,7 @@ def main() -> None:
         # state top-5 over contiguous class IDs (0..32)
         top5_class = topk_states(out.state.probs, k=5).cpu().numpy()  # (B,5)
 
-        # map contiguous class IDs back to Kaggle/original state_idx values
+        # map contiguous class IDs back to Kaggle/original state_idx values (as integers)
         top5_state_idx = np.empty_like(top5_class, dtype=np.int64)
         for i in range(top5_class.shape[0]):
             for j in range(top5_class.shape[1]):
@@ -163,20 +168,55 @@ def main() -> None:
     top5_idx = np.concatenate(all_state_top5_idx, axis=0)
     latlon = np.concatenate(all_latlon, axis=0)
 
-    # Write back by sample_id alignment
-    id_to_row = {int(sid): i for i, sid in enumerate(template["sample_id"].values)}
+    # Create submission dataframe with only required columns
+    # Start with template data (sample_id and image paths)
+    submission = template[
+        ["sample_id", "image_north", "image_east", "image_south", "image_west"]
+    ].copy()
+
+    # Initialize prediction columns
+    for col in [
+        "predicted_state_idx_1",
+        "predicted_state_idx_2",
+        "predicted_state_idx_3",
+        "predicted_state_idx_4",
+        "predicted_state_idx_5",
+        "predicted_latitude",
+        "predicted_longitude",
+    ]:
+        submission[col] = np.nan
+
+    # Write predictions back by sample_id alignment
+    id_to_row = {int(sid): i for i, sid in enumerate(submission["sample_id"].values)}
     for sid, t5, ll in zip(ids, top5_idx, latlon):
         r = id_to_row[int(sid)]
-        template.loc[r, "predicted_state_idx_1"] = int(t5[0])
-        template.loc[r, "predicted_state_idx_2"] = int(t5[1])
-        template.loc[r, "predicted_state_idx_3"] = int(t5[2])
-        template.loc[r, "predicted_state_idx_4"] = int(t5[3])
-        template.loc[r, "predicted_state_idx_5"] = int(t5[4])
-        template.loc[r, "predicted_latitude"] = float(ll[0])
-        template.loc[r, "predicted_longitude"] = float(ll[1])
+        # Ensure state IDs are integers
+        submission.loc[r, "predicted_state_idx_1"] = int(t5[0])
+        submission.loc[r, "predicted_state_idx_2"] = int(t5[1])
+        submission.loc[r, "predicted_state_idx_3"] = int(t5[2])
+        submission.loc[r, "predicted_state_idx_4"] = int(t5[3])
+        submission.loc[r, "predicted_state_idx_5"] = int(t5[4])
+        submission.loc[r, "predicted_latitude"] = float(ll[0])
+        submission.loc[r, "predicted_longitude"] = float(ll[1])
+
+    # Ensure state ID columns are integers (convert any remaining NaN/invalid to 0)
+    state_cols = [
+        "predicted_state_idx_1",
+        "predicted_state_idx_2",
+        "predicted_state_idx_3",
+        "predicted_state_idx_4",
+        "predicted_state_idx_5",
+    ]
+    for col in state_cols:
+        submission[col] = (
+            pd.to_numeric(submission[col], errors="coerce").fillna(0).astype(int)
+        )
+
+    # Reorder columns to match required order
+    submission = submission[required_cols]
 
     out_path = Path(args.out_csv)
-    template.to_csv(out_path, index=False)
+    submission.to_csv(out_path, index=False)
     print(f"Wrote submission to: {out_path}")
 
 

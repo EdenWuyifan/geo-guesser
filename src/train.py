@@ -14,9 +14,13 @@ from datasets import StateIndexMapper, StreetViewDataset, collate_streetview
 
 from models.dinov3 import DinoV3Encoder  # HuggingFace-backed encoder
 from models.fusion_transformer import DirectionalFusionTransformer
-from models.geo_geussr import GeoGuessrModel, StateHead, GeoHead
+from models.geo_geussr import (
+    GeoGuessrModel,
+    StateHead,
+    MixtureGeoHead,
+)
 
-from losses import MultiTaskLoss
+from losses import MixtureMultiTaskLoss
 
 from geo_cell import build_geo_cells
 
@@ -310,8 +314,7 @@ def main() -> None:
 
     # Pre-allocate cell_ids tensor on GPU for faster batch lookup (using row_idx from dataset)
     cell_ids_tensor = torch.from_numpy(cell_ids_np).to(device)
-    centroids_tensor = torch.from_numpy(centroids_np).to(device).float()
-    log_step("Pre-allocation", "Pre-allocated cell_ids and centroids tensors on GPU")
+    log_step("Pre-allocation", "Pre-allocated cell_ids tensor on GPU")
 
     log_step("Saving", "Saving geo cell data...")
     np.save(out_dir / "geo_cell_centroids.npy", centroids_np)
@@ -323,8 +326,23 @@ def main() -> None:
     log_step("Encoder", f"Loading DINOv3 encoder: {args.hf_model_id}...")
     # Use bfloat16 for large models to save memory and potentially speed up on modern GPUs
     torch_dtype = torch.bfloat16 if device.type == "cuda" else None
+
+    # Enable LoRA on last 4 blocks by default
+    lora_rank = 8
+    lora_alpha = 16.0
+    lora_layers = 4
+    log_step(
+        "LoRA",
+        f"Adding LoRA adapters (rank={lora_rank}, alpha={lora_alpha}, layers={lora_layers})...",
+    )
     encoder = DinoV3Encoder(
-        model_id=args.hf_model_id, freeze=True, torch_dtype=torch_dtype
+        model_id=args.hf_model_id,
+        freeze=True,  # Freeze base weights, only LoRA params trainable
+        torch_dtype=torch_dtype,
+        use_lora=True,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_layers=lora_layers,
     ).to(device)
     embed_dim = encoder.embed_dim
     log_step("Success", f"Encoder embed dimension: {embed_dim}")
@@ -363,8 +381,20 @@ def main() -> None:
     log_step("State Head", f"Creating StateHead (num_states={num_states})...")
     state_head = StateHead(embed_dim=embed_dim, num_states=num_states).to(device)
 
-    log_step("Geo Head", f"Creating GeoHead (num_cells={len(centroids_np)})...")
-    geo_head = GeoHead(embed_dim=embed_dim, num_cells=len(centroids_np)).to(device)
+    # Default: use mixture-of-experts regression (5 components, with cell aux loss)
+    num_components = 5
+    use_cell_aux = True
+    log_step(
+        "Geo Head",
+        f"Creating MixtureGeoHead (num_components={num_components}, "
+        f"use_cell_aux={use_cell_aux})...",
+    )
+    geo_head = MixtureGeoHead(
+        embed_dim=embed_dim,
+        num_components=num_components,
+        use_cell_aux=use_cell_aux,
+        num_cells=len(centroids_np),
+    ).to(device)
 
     log_step("Assembling", "Assembling GeoGuessrModel...")
     model = GeoGuessrModel(
@@ -439,25 +469,83 @@ def main() -> None:
 
     log_section("⚙️  Training Setup")
 
-    log_step("Loss", "Creating MultiTaskLoss...")
-    log_step("", "  State smoothing: 0.1, λ_state: 1.0, λ_cell: 1.0, λ_gps: 1.0")
-    log_step("", "  GPS loss type: huber")
-    loss_fn = MultiTaskLoss(
+    log_step("Loss", "Creating MixtureMultiTaskLoss...")
+    log_step(
+        "",
+        f"  State smoothing: 0.1, λ_state: 1.0, λ_gps: 1.0, "
+        f"use_cell_aux: {use_cell_aux}",
+    )
+    log_step("", "  λ_cell: 0.5 (auxiliary loss)")
+    loss_fn = MixtureMultiTaskLoss(
         state_smoothing=0.1,
         lambda_state=1.0,
-        lambda_cell=1.0,
+        lambda_cell=0.5,
         lambda_gps=1.0,
-        gps_loss_type="huber",
+        use_cell_aux=use_cell_aux,
     ).to(device)
 
-    log_step(
-        "Optimizer", f"Creating AdamW optimizer (lr={args.lr}, weight_decay=1e-2)..."
-    )
+    log_step("Optimizer", "Setting up layer-wise learning rate decay (LLRD)...")
+
+    # Layer-wise learning rate decay strategy:
+    # - Heads & Fusion: high LR (base_lr)
+    # - Last blocks (LoRA): medium LR (base_lr * 0.1)
+    # - Earlier blocks: frozen (LR = 0, but handled by freeze=True)
+
+    base_lr = args.lr
+    lora_lr = base_lr * 0.1  # 10x smaller for LoRA adapters
+
+    # Group parameters by component
+    param_groups = []
+
+    # Heads and fusion: high LR
+    head_fusion_params = []
+    if hasattr(model, "state_head"):
+        head_fusion_params.extend(
+            [p for p in model.state_head.parameters() if p.requires_grad]
+        )
+    if hasattr(model, "geo_head"):
+        head_fusion_params.extend(
+            [p for p in model.geo_head.parameters() if p.requires_grad]
+        )
+    if hasattr(model, "fusion"):
+        head_fusion_params.extend(
+            [p for p in model.fusion.parameters() if p.requires_grad]
+        )
+
+    if head_fusion_params:
+        param_groups.append(
+            {
+                "params": head_fusion_params,
+                "lr": base_lr,
+                "name": "heads_fusion",
+            }
+        )
+        log_step(
+            "", f"  Heads & Fusion: {len(head_fusion_params)} params @ LR={base_lr:.2e}"
+        )
+
+    # LoRA adapters: medium LR
+    lora_params = []
+    for name, param in model.named_parameters():
+        if "lora" in name.lower() and param.requires_grad:
+            lora_params.append(param)
+
+    if lora_params:
+        param_groups.append(
+            {
+                "params": lora_params,
+                "lr": lora_lr,
+                "name": "lora_adapters",
+            }
+        )
+        log_step("", f"  LoRA adapters: {len(lora_params)} params @ LR={lora_lr:.2e}")
+
+    # Create optimizer with parameter groups
     optim = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
+        param_groups,
         weight_decay=1e-2,
     )
+    log_step("Success", f"Optimizer created with {len(param_groups)} parameter groups")
 
     log_step("Scaler", "Creating GradScaler for mixed precision...")
     scaler = GradScaler(
@@ -476,20 +564,34 @@ def main() -> None:
         # Verify checkpoint compatibility
         ckpt_embed_dim = ckpt.get("embed_dim")
         ckpt_num_states = ckpt.get("num_states")
-        ckpt_num_cells = ckpt.get("num_cells")
+        ckpt_use_mixture = ckpt.get(
+            "use_mixture", True
+        )  # Default to True for new checkpoints
+
         if (
             ckpt_embed_dim != embed_dim
             or ckpt_num_states != num_states
-            or ckpt_num_cells != len(centroids_np)
+            or ckpt_use_mixture is not True
         ):
             log_step(
                 "Error",
                 f"Checkpoint incompatible: embed_dim={ckpt_embed_dim} vs {embed_dim}, "
                 f"num_states={ckpt_num_states} vs {num_states}, "
-                f"num_cells={ckpt_num_cells} vs {len(centroids_np)}",
+                f"use_mixture={ckpt_use_mixture} vs True",
                 level="error",
             )
             raise ValueError("Checkpoint configuration mismatch")
+
+        ckpt_num_components = ckpt.get("num_components", num_components)
+        ckpt_use_cell_aux = ckpt.get("use_cell_aux", use_cell_aux)
+        if ckpt_num_components != num_components or ckpt_use_cell_aux != use_cell_aux:
+            log_step(
+                "Error",
+                f"Mixture model mismatch: num_components={ckpt_num_components} vs {num_components}, "
+                f"use_cell_aux={ckpt_use_cell_aux} vs {use_cell_aux}",
+                level="error",
+            )
+            raise ValueError("Checkpoint mixture configuration mismatch")
 
         # Load model state
         model.load_state_dict(ckpt["model"], strict=True)
@@ -573,20 +675,16 @@ def main() -> None:
             with autocast(device_type=dtype, enabled=(device.type == "cuda")):
                 out = model(images)
 
-                # Use expected centroid (soft assignment) for smoother, more stable training
-                # Alternative: use true cell centroid (teacher forcing) for faster convergence:
-                #   centroid = centroids_tensor[true_cell]  # (B, 2)
-                # Expected centroid is differentiable and handles uncertainty better
-                centroid = out.geo.cell_probs @ centroids_tensor  # (B,C)@(C,2)->(B,2)
-                pred_latlon = centroid + out.geo.residual
-
+                # Mixture-of-experts: use NLL loss directly on mixture
                 loss_out = loss_fn(
                     state_logits=out.state.logits,
-                    cell_logits=out.geo.cell_logits,
-                    pred_latlon=pred_latlon,
+                    means=out.geo.means,
+                    covariances=out.geo.covariances,
+                    weights=out.geo.weights,
                     true_state=state_class,
-                    true_cell=true_cell,
                     true_latlon=latlon,
+                    cell_logits=out.geo.cell_logits,
+                    true_cell=true_cell,
                 )
 
             # Scale loss by accumulation steps for correct averaging
@@ -606,7 +704,8 @@ def main() -> None:
             with torch.no_grad():
                 running_total += loss_out.total.detach() * bs
                 running_state += loss_out.parts["state"].detach() * bs
-                running_cell += loss_out.parts["cell"].detach() * bs
+                if "cell" in loss_out.parts:
+                    running_cell += loss_out.parts["cell"].detach() * bs
                 running_gps += loss_out.parts["gps"].detach() * bs
                 seen += bs
 
@@ -633,8 +732,8 @@ def main() -> None:
         print(
             f"  {Colors.GREEN}Total Loss:{Colors.END} {avg_total:.6f} | "
             f"{Colors.BLUE}State:{Colors.END} {avg_state:.6f} | "
-            f"{Colors.BLUE}Cell:{Colors.END} {avg_cell:.6f} | "
-            f"{Colors.BLUE}GPS:{Colors.END} {avg_gps:.6f}"
+            f"{Colors.BLUE}Cell (aux):{Colors.END} {avg_cell:.6f} | "
+            f"{Colors.BLUE}GPS (NLL):{Colors.END} {avg_gps:.6f}"
         )
 
         log_step("Saving", f"Saving checkpoint for epoch {epoch}...")
@@ -651,6 +750,9 @@ def main() -> None:
                 "embed_dim": embed_dim,
                 "num_states": num_states,
                 "num_cells": len(centroids_np),
+                "use_mixture": True,
+                "num_components": num_components,
+                "use_cell_aux": use_cell_aux,
             },
             ckpt_path,
         )

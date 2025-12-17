@@ -5,6 +5,7 @@ from typing import Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import MultivariateNormal
 
 
 class LabelSmoothingCrossEntropy(nn.Module):
@@ -19,7 +20,6 @@ class LabelSmoothingCrossEntropy(nn.Module):
         logits: (B, C)
         target: (B,)
         """
-        n_classes = logits.size(-1)
         log_probs = F.log_softmax(logits, dim=-1)
         # Negative log-likelihood for true class
         nll = F.nll_loss(log_probs, target, reduction="none")
@@ -80,6 +80,56 @@ class LossOutput:
     parts: Dict[str, torch.Tensor]
 
 
+class MixtureNLLLoss(nn.Module):
+    """
+    Negative log-likelihood loss for mixture of Gaussians.
+    Handles multi-modal geolocation uncertainty.
+    """
+
+    def __init__(self, reduction: str = "mean") -> None:
+        super().__init__()
+        if reduction not in {"mean", "sum", "none"}:
+            raise ValueError("reduction must be one of: mean, sum, none")
+        self.reduction = reduction
+
+    def forward(
+        self,
+        means: torch.Tensor,  # (B, K, 2)
+        covariances: torch.Tensor,  # (B, K, 2, 2)
+        weights: torch.Tensor,  # (B, K)
+        true_latlon: torch.Tensor,  # (B, 2)
+    ) -> torch.Tensor:
+        """
+        Compute negative log-likelihood of true_latlon under mixture distribution.
+        """
+        B, K, _ = means.shape
+
+        # Compute log-probability for each mixture component
+        log_probs = []
+        for k in range(K):
+            comp_dist = MultivariateNormal(
+                loc=means[:, k, :],  # (B, 2)
+                covariance_matrix=covariances[:, k, :, :],  # (B, 2, 2)
+            )
+            log_prob_k = comp_dist.log_prob(true_latlon)  # (B,)
+            log_probs.append(log_prob_k)
+
+        # Stack: (B, K)
+        log_probs_stack = torch.stack(log_probs, dim=1)
+        log_weights = torch.log(weights + 1e-8)  # (B, K)
+
+        # Log-sum-exp for numerical stability: log(sum_k w_k * exp(log_prob_k))
+        # = log(sum_k exp(log_weights_k + log_prob_k))
+        log_mixture_prob = torch.logsumexp(log_weights + log_probs_stack, dim=1)  # (B,)
+        nll = -log_mixture_prob  # (B,)
+
+        if self.reduction == "mean":
+            return nll.mean()
+        elif self.reduction == "sum":
+            return nll.sum()
+        return nll
+
+
 class MultiTaskLoss(nn.Module):
     def __init__(
         self,
@@ -119,3 +169,59 @@ class MultiTaskLoss(nn.Module):
 
         total = self.lambda_state * ls + self.lambda_cell * lc + self.lambda_gps * lg
         return LossOutput(total=total, parts={"state": ls, "cell": lc, "gps": lg})
+
+
+class MixtureMultiTaskLoss(nn.Module):
+    """
+    Multi-task loss for mixture-of-experts geolocation model.
+    Uses NLL for mixture GPS prediction instead of point regression.
+    """
+
+    def __init__(
+        self,
+        state_smoothing: float = 0.1,
+        lambda_state: float = 1.0,
+        lambda_cell: float = 0.0,  # Optional auxiliary loss
+        lambda_gps: float = 1.0,
+        use_cell_aux: bool = False,
+    ) -> None:
+        super().__init__()
+        self.state_loss = LabelSmoothingCrossEntropy(state_smoothing)
+        self.mixture_gps_loss = MixtureNLLLoss()
+        self.use_cell_aux = use_cell_aux
+
+        if use_cell_aux:
+            self.cell_loss = nn.CrossEntropyLoss()
+        else:
+            self.cell_loss = None
+
+        self.lambda_state = lambda_state
+        self.lambda_cell = lambda_cell if use_cell_aux else 0.0
+        self.lambda_gps = lambda_gps
+
+    def forward(
+        self,
+        state_logits: torch.Tensor,
+        means: torch.Tensor,  # (B, K, 2)
+        covariances: torch.Tensor,  # (B, K, 2, 2)
+        weights: torch.Tensor,  # (B, K)
+        true_state: torch.Tensor,
+        true_latlon: torch.Tensor,
+        cell_logits: torch.Tensor | None = None,
+        true_cell: torch.Tensor | None = None,
+    ) -> LossOutput:
+        ls = self.state_loss(state_logits, true_state)
+        lg = self.mixture_gps_loss(means, covariances, weights, true_latlon)
+
+        parts = {"state": ls, "gps": lg}
+
+        if self.use_cell_aux and cell_logits is not None and true_cell is not None:
+            lc = self.cell_loss(cell_logits, true_cell)
+            parts["cell"] = lc
+            total = (
+                self.lambda_state * ls + self.lambda_cell * lc + self.lambda_gps * lg
+            )
+        else:
+            total = self.lambda_state * ls + self.lambda_gps * lg
+
+        return LossOutput(total=total, parts=parts)
