@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -71,6 +72,21 @@ def seed_everything(seed: int = 42) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def find_latest_checkpoint(out_dir: Path) -> Path | None:
+    """Find the latest checkpoint file in out_dir matching model_epoch_*.pt pattern."""
+    checkpoints = list(out_dir.glob("model_epoch_*.pt"))
+    if not checkpoints:
+        return None
+
+    # Extract epoch numbers and find the latest
+    def extract_epoch(path: Path) -> int:
+        match = re.search(r"model_epoch_(\d+)\.pt", path.name)
+        return int(match.group(1)) if match else -1
+
+    latest = max(checkpoints, key=extract_epoch)
+    return latest
 
 
 def main() -> None:
@@ -184,6 +200,18 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     log_step("Output", f"Checkpoints will be saved to: {out_dir}")
+
+    # Check for existing checkpoints to resume from
+    resume_checkpoint = find_latest_checkpoint(out_dir)
+    start_epoch = 1
+    if resume_checkpoint:
+        log_step(
+            "Resume",
+            f"Found checkpoint: {resume_checkpoint.name}",
+            level="success",
+        )
+    else:
+        log_step("Resume", "No existing checkpoint found, starting from scratch")
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -439,7 +467,71 @@ def main() -> None:
         log_step("Success", "Mixed precision training enabled")
 
     log_section("🚀 Training")
-    log_step("Starting", f"Training for {args.epochs} epochs on {device}")
+
+    # Load checkpoint if resuming
+    if resume_checkpoint:
+        log_step("Loading", f"Loading checkpoint from {resume_checkpoint.name}...")
+        ckpt = torch.load(resume_checkpoint, map_location=device)
+
+        # Verify checkpoint compatibility
+        ckpt_embed_dim = ckpt.get("embed_dim")
+        ckpt_num_states = ckpt.get("num_states")
+        ckpt_num_cells = ckpt.get("num_cells")
+        if (
+            ckpt_embed_dim != embed_dim
+            or ckpt_num_states != num_states
+            or ckpt_num_cells != len(centroids_np)
+        ):
+            log_step(
+                "Error",
+                f"Checkpoint incompatible: embed_dim={ckpt_embed_dim} vs {embed_dim}, "
+                f"num_states={ckpt_num_states} vs {num_states}, "
+                f"num_cells={ckpt_num_cells} vs {len(centroids_np)}",
+                level="error",
+            )
+            raise ValueError("Checkpoint configuration mismatch")
+
+        # Load model state
+        model.load_state_dict(ckpt["model"], strict=True)
+
+        # Load optimizer and scaler state if available
+        if "optimizer" in ckpt:
+            optim.load_state_dict(ckpt["optimizer"])
+            log_step("Success", "Loaded optimizer state")
+        if "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
+            log_step("Success", "Loaded scaler state")
+
+        # Determine starting epoch
+        if "epoch" in ckpt:
+            start_epoch = ckpt["epoch"] + 1
+            log_step("Success", f"Resuming from epoch {start_epoch}")
+        else:
+            # Fallback: extract epoch from filename
+            match = re.search(r"model_epoch_(\d+)\.pt", resume_checkpoint.name)
+            if match:
+                start_epoch = int(match.group(1)) + 1
+                log_step(
+                    "Success",
+                    f"Resuming from epoch {start_epoch} (extracted from filename)",
+                )
+            else:
+                log_step(
+                    "Warning",
+                    "Could not determine resume epoch, starting from epoch 1",
+                    level="warning",
+                )
+                start_epoch = 1
+
+        if start_epoch > args.epochs:
+            log_step(
+                "Warning",
+                f"Checkpoint epoch {start_epoch-1} >= target epochs {args.epochs}, nothing to train",
+                level="warning",
+            )
+    else:
+        log_step("Starting", f"Training for {args.epochs} epochs on {device}")
+
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
         log_step(
@@ -449,7 +541,7 @@ def main() -> None:
         )
     model.train()
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         print(f"\n{Colors.BOLD}{Colors.CYAN}{'─'*70}{Colors.END}")
         log_step("Epoch", f"{epoch}/{args.epochs}", level="header")
         print(f"{Colors.BOLD}{Colors.CYAN}{'─'*70}{Colors.END}\n")
@@ -549,7 +641,10 @@ def main() -> None:
         ckpt_path = out_dir / f"model_epoch_{epoch}.pt"
         torch.save(
             {
+                "epoch": epoch,
                 "model": model.state_dict(),
+                "optimizer": optim.state_dict(),
+                "scaler": scaler.state_dict(),
                 "args": vars(args),
                 "hf_model_id": args.hf_model_id,
                 "state_mapping": args.state_mapping,
