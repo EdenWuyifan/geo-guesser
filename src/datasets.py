@@ -62,6 +62,7 @@ class StateIndexMapper:
 
 @dataclass(frozen=True)
 class StreetViewSample:
+    row_idx: int  # CSV row index for efficient cell_id lookup
     sample_id: int
     images: Dict[str, torch.Tensor]  # {"north": [3,H,W], ...}
     state_class: Optional[int]  # contiguous class id (0..32), None for test
@@ -161,12 +162,21 @@ class StreetViewDataset(Dataset):
         }
 
         if not self.is_train:
-            return StreetViewSample(sample_id, images, None, None, None, None)
+            return StreetViewSample(
+                row_idx=idx,
+                sample_id=sample_id,
+                images=images,
+                state_class=None,
+                state_idx=None,
+                latitude=None,
+                longitude=None,
+            )
 
         state_idx = int(row["state_idx"])
         state_class = self.state_mapper.to_class(state_idx)
 
         return StreetViewSample(
+            row_idx=idx,
             sample_id=sample_id,
             images=images,
             state_class=state_class,
@@ -181,13 +191,18 @@ DIRECTIONS = ("north", "east", "south", "west")
 
 def collate_streetview(batch: List[StreetViewSample]) -> Dict[str, torch.Tensor]:
     sample_ids = torch.tensor([s.sample_id for s in batch], dtype=torch.long)
+    row_indices = torch.tensor([s.row_idx for s in batch], dtype=torch.long)
 
     views = []
     for s in batch:
         views.append(torch.stack([s.images[d] for d in DIRECTIONS], dim=0))  # (4,3,H,W)
     images = torch.stack(views, dim=0)  # (B,4,3,H,W)
 
-    out: Dict[str, torch.Tensor] = {"sample_id": sample_ids, "images": images}
+    out: Dict[str, torch.Tensor] = {
+        "sample_id": sample_ids,
+        "row_idx": row_indices,
+        "images": images,
+    }
 
     if batch[0].state_class is not None:
         out["state_class"] = torch.tensor(

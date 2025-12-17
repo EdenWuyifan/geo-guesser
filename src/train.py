@@ -5,7 +5,6 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
@@ -85,7 +84,7 @@ def main() -> None:
     ap.add_argument(
         "--batch_size",
         type=int,
-        default=32,
+        default=256,
         help="Batch size. Increase for higher GPU utilization (if memory allows).",
     )
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -105,8 +104,11 @@ def main() -> None:
     )
     ap.add_argument(
         "--compile_model",
-        action="store_true",
-        help="Use torch.compile() for faster inference (PyTorch 2.0+, may require CUDA)",
+        type=str,
+        default="none",
+        choices=["none", "full", "heads"],
+        help="Compilation strategy: 'none' (default, recommended for debugging), "
+        "'full' (compile entire model), 'heads' (compile only trainable heads)",
     )
     ap.add_argument(
         "--state_mapping",
@@ -135,14 +137,14 @@ def main() -> None:
     ap.add_argument(
         "--num_workers",
         type=int,
-        default=8,
+        default=2,
         help="Number of DataLoader workers (increase for faster data loading). "
         "Recommended: 4-8 for most systems, higher if you have many CPU cores.",
     )
     ap.add_argument(
         "--prefetch_factor",
         type=int,
-        default=4,
+        default=8,
         help="DataLoader prefetch factor (higher = more prefetching). "
         "Higher values keep GPU fed with data.",
     )
@@ -194,7 +196,11 @@ def main() -> None:
         # Enable CUDA optimizations for better GPU utilization
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
-        log_step("CUDA", "Enabled cudnn.benchmark for optimized performance")
+        torch.set_float32_matmul_precision("high")
+        log_step(
+            "CUDA",
+            "Enabled cudnn.benchmark and high-precision matmul for optimized performance",
+        )
 
         # Set memory allocation strategy
         torch.cuda.empty_cache()
@@ -274,16 +280,7 @@ def main() -> None:
     if "s2_level" in geo_cells.meta:
         log_step("", f"  S2 Level: {geo_cells.meta['s2_level']}")
 
-    # Create mapping from sample_id to row index (for cell_id lookup)
-    # Also pre-allocate cell_ids tensor on GPU for faster lookup
-    df_geo = pd.read_csv(train_csv)
-    sample_id_to_idx = {int(sid): idx for idx, sid in enumerate(df_geo["sample_id"])}
-    log_step(
-        "Mapping",
-        f"Created sample_id -> row_index mapping for {len(sample_id_to_idx):,} samples",
-    )
-
-    # Pre-allocate cell_ids tensor on GPU for faster batch lookup
+    # Pre-allocate cell_ids tensor on GPU for faster batch lookup (using row_idx from dataset)
     cell_ids_tensor = torch.from_numpy(cell_ids_np).to(device)
     centroids_tensor = torch.from_numpy(centroids_np).to(device).float()
     log_step("Pre-allocation", "Pre-allocated cell_ids and centroids tensors on GPU")
@@ -349,10 +346,22 @@ def main() -> None:
         geo_head=geo_head,
     ).to(device)
 
-    # Compile model for faster inference (PyTorch 2.0+)
-    if args.compile_model:
+    # Convert model to channels-last memory format for better GPU utilization (Ampere+)
+    if device.type == "cuda":
         try:
-            log_step("Compiling", "Compiling model with torch.compile()...")
+            model = model.to(memory_format=torch.channels_last)
+            log_step("Memory", "Converted model to channels-last memory format")
+        except Exception as e:
+            log_step(
+                "Warning",
+                f"Failed to convert to channels-last: {e}",
+                level="warning",
+            )
+
+    # Compile model selectively (PyTorch 2.0+)
+    if args.compile_model == "full":
+        try:
+            log_step("Compiling", "Compiling entire model with torch.compile()...")
             model = torch.compile(model, mode="reduce-overhead")
             log_step("Success", "Model compiled for faster inference")
         except Exception as e:
@@ -361,6 +370,28 @@ def main() -> None:
                 f"torch.compile() failed (may not be available): {e}",
                 level="warning",
             )
+    elif args.compile_model == "heads":
+        try:
+            log_step(
+                "Compiling",
+                "Compiling only trainable heads with torch.compile()...",
+            )
+            # Compile only the trainable components (heads and fusion)
+            model.fusion = torch.compile(model.fusion, mode="reduce-overhead")
+            model.state_head = torch.compile(model.state_head, mode="reduce-overhead")
+            model.geo_head = torch.compile(model.geo_head, mode="reduce-overhead")
+            log_step("Success", "Trainable heads compiled for faster inference")
+        except Exception as e:
+            log_step(
+                "Warning",
+                f"torch.compile() on heads failed: {e}",
+                level="warning",
+            )
+    else:
+        log_step(
+            "Compile",
+            "Model compilation disabled (use --compile_model full/heads to enable)",
+        )
 
     # Count trainable parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -423,31 +454,38 @@ def main() -> None:
         log_step("Epoch", f"{epoch}/{args.epochs}", level="header")
         print(f"{Colors.BOLD}{Colors.CYAN}{'─'*70}{Colors.END}\n")
 
-        running = {"total": 0.0, "state": 0.0, "cell": 0.0, "gps": 0.0}
-        n = 0
+        # Use GPU tensors for accumulation to avoid CPU sync on every batch
+        running_total = torch.zeros((), device=device, dtype=torch.float32)
+        running_state = torch.zeros((), device=device, dtype=torch.float32)
+        running_cell = torch.zeros((), device=device, dtype=torch.float32)
+        running_gps = torch.zeros((), device=device, dtype=torch.float32)
+        seen = torch.zeros((), device=device, dtype=torch.float32)
         optim.zero_grad(set_to_none=True)  # Initialize gradients at start of epoch
 
         for batch_idx, batch in enumerate(loader):
+            # Transfer to device with channels-last if supported
             images = batch["images"].to(device, non_blocking=True)  # (B,4,3,H,W)
+            if device.type == "cuda":
+                try:
+                    images = images.to(memory_format=torch.channels_last)
+                except Exception:
+                    pass  # Fallback to contiguous if not supported
             state_class = batch["state_class"].to(device, non_blocking=True)  # (B,)
             latlon = batch["latlon"].to(device, non_blocking=True)  # (B,2)
 
-            # Get true cell ids using pre-allocated GPU tensor (much faster than CPU->GPU transfer)
-            sample_ids = batch["sample_id"].cpu().numpy()
-            row_indices = torch.tensor(
-                [sample_id_to_idx[int(sid)] for sid in sample_ids],
-                device=device,
-                dtype=torch.long,
-            )
-            true_cell = cell_ids_tensor[row_indices]
+            # Get true cell ids using row_idx directly (no Python loop, no CPU sync)
+            row_idx = batch["row_idx"].to(device, non_blocking=True)
+            true_cell = cell_ids_tensor[row_idx]
 
             dtype = "cuda" if device.type == "cuda" else "cpu"
             with autocast(device_type=dtype, enabled=(device.type == "cuda")):
                 out = model(images)
 
-                # Get predicted cell and use its centroid (all on GPU, no CPU sync)
-                pred_cell_indices = out.geo.cell_logits.argmax(dim=-1)  # (B,)
-                centroid = centroids_tensor[pred_cell_indices]  # (B, 2)
+                # Use expected centroid (soft assignment) for smoother, more stable training
+                # Alternative: use true cell centroid (teacher forcing) for faster convergence:
+                #   centroid = centroids_tensor[true_cell]  # (B, 2)
+                # Expected centroid is differentiable and handles uncertainty better
+                centroid = out.geo.cell_probs @ centroids_tensor  # (B,C)@(C,2)->(B,2)
                 pred_latlon = centroid + out.geo.residual
 
                 loss_out = loss_fn(
@@ -472,17 +510,20 @@ def main() -> None:
                 optim.zero_grad(set_to_none=True)
 
             bs = len(images)
-            n += bs
-            # Accumulate losses (detach to avoid keeping graph, but keep on GPU until final sync)
+            # Accumulate on GPU (no CPU sync until logging) - massive speedup
             with torch.no_grad():
-                running["total"] += loss_out.total.item() * bs
-                for k, v in loss_out.parts.items():
-                    running[k] += v.item() * bs
+                running_total += loss_out.total.detach() * bs
+                running_state += loss_out.parts["state"].detach() * bs
+                running_cell += loss_out.parts["cell"].detach() * bs
+                running_gps += loss_out.parts["gps"].detach() * bs
+                seen += bs
 
-            # Progress update every 100 batches (reduced overhead)
+            # Progress update every 100 batches (only sync GPU->CPU here)
             if (batch_idx + 1) % 100 == 0 or (batch_idx + 1) == len(loader):
                 progress_pct = 100 * (batch_idx + 1) / len(loader)
-                current_loss = running["total"] / n
+                current_loss = (
+                    running_total / seen
+                ).item()  # Single GPU sync per 100 steps
                 print(
                     f"{Colors.DIM}[{datetime.now().strftime('%H:%M:%S')}]{Colors.END} "
                     f"{Colors.CYAN}Batch {batch_idx+1:5d}/{len(loader)}{Colors.END} "
@@ -491,14 +532,17 @@ def main() -> None:
                     flush=True,
                 )
 
-        # Epoch summary
-        avg_losses = {k: running[k] / n for k in running.keys()}
+        # Epoch summary (sync GPU->CPU only once at epoch end)
+        avg_total = (running_total / seen).item()
+        avg_state = (running_state / seen).item()
+        avg_cell = (running_cell / seen).item()
+        avg_gps = (running_gps / seen).item()
         print(f"\n{Colors.BOLD}Epoch {epoch} Summary:{Colors.END}")
         print(
-            f"  {Colors.GREEN}Total Loss:{Colors.END} {avg_losses['total']:.6f} | "
-            f"{Colors.BLUE}State:{Colors.END} {avg_losses['state']:.6f} | "
-            f"{Colors.BLUE}Cell:{Colors.END} {avg_losses['cell']:.6f} | "
-            f"{Colors.BLUE}GPS:{Colors.END} {avg_losses['gps']:.6f}"
+            f"  {Colors.GREEN}Total Loss:{Colors.END} {avg_total:.6f} | "
+            f"{Colors.BLUE}State:{Colors.END} {avg_state:.6f} | "
+            f"{Colors.BLUE}Cell:{Colors.END} {avg_cell:.6f} | "
+            f"{Colors.BLUE}GPS:{Colors.END} {avg_gps:.6f}"
         )
 
         log_step("Saving", f"Saving checkpoint for epoch {epoch}...")
