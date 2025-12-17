@@ -138,12 +138,6 @@ def main() -> None:
         help="Path to state_mapping.csv (relative to repo root or absolute).",
     )
     ap.add_argument(
-        "--geo_centroids",
-        type=str,
-        default="data/geo_cell_centroids.npy",
-        help="Path to geo_cell_centroids.npy (relative to repo root or absolute).",
-    )
-    ap.add_argument(
         "--geo_method",
         type=str,
         default="kmeans3d",
@@ -580,11 +574,20 @@ def main() -> None:
         ckpt = torch.load(resume_checkpoint, map_location=device)
 
         # Verify checkpoint compatibility
-        ckpt_embed_dim = ckpt.get("embed_dim")
-        ckpt_num_states = ckpt.get("num_states")
-        ckpt_use_mixture = ckpt.get(
-            "use_mixture", True
-        )  # Default to True for new checkpoints
+        ckpt_config = ckpt.get("config", {})
+        if not ckpt_config:
+            # Legacy checkpoint format
+            ckpt_config = {
+                "embed_dim": ckpt.get("embed_dim"),
+                "num_states": ckpt.get("num_states"),
+                "use_mixture": ckpt.get("use_mixture", True),
+                "num_components": ckpt.get("num_components", num_components),
+                "use_cell_aux": ckpt.get("use_cell_aux", use_cell_aux),
+            }
+
+        ckpt_embed_dim = ckpt_config.get("embed_dim")
+        ckpt_num_states = ckpt_config.get("num_states")
+        ckpt_use_mixture = ckpt_config.get("use_mixture", True)
 
         if (
             ckpt_embed_dim != embed_dim
@@ -600,8 +603,8 @@ def main() -> None:
             )
             raise ValueError("Checkpoint configuration mismatch")
 
-        ckpt_num_components = ckpt.get("num_components", num_components)
-        ckpt_use_cell_aux = ckpt.get("use_cell_aux", use_cell_aux)
+        ckpt_num_components = ckpt_config.get("num_components", num_components)
+        ckpt_use_cell_aux = ckpt_config.get("use_cell_aux", use_cell_aux)
         if ckpt_num_components != num_components or ckpt_use_cell_aux != use_cell_aux:
             log_step(
                 "Error",
@@ -771,21 +774,32 @@ def main() -> None:
 
         log_step("Saving", f"Saving checkpoint for epoch {epoch}...")
         ckpt_path = out_dir / f"model_epoch_{epoch}.pt"
+
+        # Save geo cell centroids alongside checkpoint
+        centroids_path = out_dir / f"geo_cell_centroids_epoch_{epoch}.npy"
+        np.save(centroids_path, centroids_np)
+
         torch.save(
             {
                 "epoch": epoch,
                 "model": model.state_dict(),
                 "optimizer": optim.state_dict(),
                 "scaler": scaler.state_dict(),
-                "args": vars(args),
-                "hf_model_id": args.hf_model_id,
-                "state_mapping": args.state_mapping,
-                "embed_dim": embed_dim,
-                "num_states": num_states,
-                "num_cells": len(centroids_np),
-                "use_mixture": True,
-                "num_components": num_components,
-                "use_cell_aux": use_cell_aux,
+                "config": {
+                    "hf_model_id": args.hf_model_id,
+                    "state_mapping": args.state_mapping,
+                    "embed_dim": embed_dim,
+                    "num_states": num_states,
+                    "num_cells": len(centroids_np),
+                    "use_mixture": True,
+                    "num_components": num_components,
+                    "use_cell_aux": use_cell_aux,
+                    "geo_method": args.geo_method,
+                    "fusion_layers": args.fusion_layers,
+                    "fusion_heads": args.fusion_heads,
+                    "fusion_dropout": args.fusion_dropout,
+                },
+                "centroids_path": str(centroids_path),
             },
             ckpt_path,
         )
