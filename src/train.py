@@ -357,8 +357,12 @@ def main() -> None:
     log_section("🧠 Model Initialization")
 
     log_step("Encoder", f"Loading DINOv3 encoder: {args.hf_model_id}...")
-    # Use bfloat16 for large models to save memory and potentially speed up on modern GPUs
-    torch_dtype = torch.bfloat16 if device.type == "cuda" else None
+    # Use bfloat16 for large models when supported (saves memory; stable without GradScaler)
+    torch_dtype = (
+        torch.bfloat16
+        if device.type == "cuda" and torch.cuda.is_bf16_supported()
+        else None
+    )
 
     # Enable LoRA on last 4 blocks by default
     lora_rank = 8
@@ -652,12 +656,24 @@ def main() -> None:
     )
     log_step("Success", f"Optimizer created with {len(param_groups)} parameter groups")
 
+    # AMP setup:
+    # - If model weights are bfloat16 (common for large DINOv3), GradScaler is not supported
+    #   and can crash during unscale on some PyTorch builds.
+    # - Use GradScaler only for float16 AMP.
+    use_amp = device.type == "cuda"
+    if use_amp:
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    else:
+        amp_dtype = None
+
+    scaler_enabled = use_amp and amp_dtype == torch.float16
     log_step("Scaler", "Creating GradScaler for mixed precision...")
-    scaler = GradScaler(
-        "cuda" if device.type == "cuda" else "cpu", enabled=(device.type == "cuda")
-    )
-    if device.type == "cuda":
-        log_step("Success", "Mixed precision training enabled")
+    scaler = GradScaler("cuda" if use_amp else "cpu", enabled=scaler_enabled)
+    if use_amp:
+        log_step(
+            "Success",
+            f"AMP enabled (dtype={amp_dtype}); GradScaler={'on' if scaler_enabled else 'off'}",
+        )
 
     log_section("🚀 Training")
 
@@ -804,8 +820,10 @@ def main() -> None:
             row_idx = batch["row_idx"].to(device, non_blocking=True)
             true_cell = cell_ids_tensor[row_idx]
 
-            dtype = "cuda" if device.type == "cuda" else "cpu"
-            with autocast(device_type=dtype, enabled=(device.type == "cuda")):
+            device_type = "cuda" if device.type == "cuda" else "cpu"
+            with autocast(
+                device_type=device_type, enabled=use_amp, dtype=(amp_dtype if use_amp else None)
+            ):
                 out = model(images)
 
                 if geo_head_type == "mixture":
@@ -849,14 +867,20 @@ def main() -> None:
 
             # Scale loss by accumulation steps for correct averaging
             scaled_loss = total_loss / args.gradient_accumulation_steps
-            scaler.scale(scaled_loss).backward()
+            if scaler.is_enabled():
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
 
             # Only step optimizer after accumulating gradients
             if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (
                 batch_idx + 1
             ) == len(loader):
-                scaler.step(optim)
-                scaler.update()
+                if scaler.is_enabled():
+                    scaler.step(optim)
+                    scaler.update()
+                else:
+                    optim.step()
                 optim.zero_grad(set_to_none=True)
 
             bs = len(images)
