@@ -82,7 +82,12 @@ def main() -> None:
     ap.add_argument("--train_csv", type=str, default="train_ground_truth.csv")
     ap.add_argument("--train_images", type=str, default="train_images")
     ap.add_argument("--epochs", type=int, default=5)
-    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument(
+        "--batch_size",
+        type=int,
+        default=32,
+        help="Batch size. Increase for higher GPU utilization (if memory allows).",
+    )
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--num_cells", type=int, default=1)
     ap.add_argument("--device", type=str, default="cuda")
@@ -130,14 +135,23 @@ def main() -> None:
     ap.add_argument(
         "--num_workers",
         type=int,
-        default=4,
-        help="Number of DataLoader workers (increase for faster data loading)",
+        default=8,
+        help="Number of DataLoader workers (increase for faster data loading). "
+        "Recommended: 4-8 for most systems, higher if you have many CPU cores.",
     )
     ap.add_argument(
         "--prefetch_factor",
         type=int,
-        default=2,
-        help="DataLoader prefetch factor (higher = more prefetching)",
+        default=4,
+        help="DataLoader prefetch factor (higher = more prefetching). "
+        "Higher values keep GPU fed with data.",
+    )
+    ap.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of gradient accumulation steps. "
+        "Useful to simulate larger batch sizes when limited by GPU memory.",
     )
 
     args = ap.parse_args()
@@ -172,10 +186,18 @@ def main() -> None:
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         log_step("Device", f"Using CUDA: {torch.cuda.get_device_name(0)}")
+        gpu_props = torch.cuda.get_device_properties(0)
         log_step(
             "",
-            f"  GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB",
+            f"  GPU Memory: {gpu_props.total_memory / 1e9:.2f} GB",
         )
+        # Enable CUDA optimizations for better GPU utilization
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        log_step("CUDA", "Enabled cudnn.benchmark for optimized performance")
+
+        # Set memory allocation strategy
+        torch.cuda.empty_cache()
     else:
         log_step("Device", "Using CPU")
 
@@ -216,11 +238,18 @@ def main() -> None:
     )
     log_step("Success", f"Dataset size: {len(ds):,} samples")
 
+    effective_batch_size = args.batch_size * args.gradient_accumulation_steps
     log_step(
         "DataLoader",
         f"Creating DataLoader (batch_size={args.batch_size}, "
         f"num_workers={args.num_workers}, prefetch_factor={args.prefetch_factor})...",
     )
+    if args.gradient_accumulation_steps > 1:
+        log_step(
+            "",
+            f"Gradient accumulation: {args.gradient_accumulation_steps} steps "
+            f"(effective batch size: {effective_batch_size})",
+        )
     loader = DataLoader(
         ds,
         batch_size=args.batch_size,
@@ -380,6 +409,13 @@ def main() -> None:
 
     log_section("🚀 Training")
     log_step("Starting", f"Training for {args.epochs} epochs on {device}")
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        log_step(
+            "Memory",
+            f"Initial GPU memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB / "
+            f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB",
+        )
     model.train()
 
     for epoch in range(1, args.epochs + 1):
@@ -389,6 +425,7 @@ def main() -> None:
 
         running = {"total": 0.0, "state": 0.0, "cell": 0.0, "gps": 0.0}
         n = 0
+        optim.zero_grad(set_to_none=True)  # Initialize gradients at start of epoch
 
         for batch_idx, batch in enumerate(loader):
             images = batch["images"].to(device, non_blocking=True)  # (B,4,3,H,W)
@@ -422,10 +459,17 @@ def main() -> None:
                     true_latlon=latlon,
                 )
 
-            optim.zero_grad(set_to_none=True)
-            scaler.scale(loss_out.total).backward()
-            scaler.step(optim)
-            scaler.update()
+            # Scale loss by accumulation steps for correct averaging
+            scaled_loss = loss_out.total / args.gradient_accumulation_steps
+            scaler.scale(scaled_loss).backward()
+
+            # Only step optimizer after accumulating gradients
+            if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (
+                batch_idx + 1
+            ) == len(loader):
+                scaler.step(optim)
+                scaler.update()
+                optim.zero_grad(set_to_none=True)
 
             bs = len(images)
             n += bs
