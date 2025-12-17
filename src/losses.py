@@ -104,19 +104,25 @@ class MixtureNLLLoss(nn.Module):
         """
         B, K, _ = means.shape
 
+        # Convert to float32 for MultivariateNormal (doesn't support bfloat16/half)
+        means_f32 = means.float()
+        covariances_f32 = covariances.float()
+        true_latlon_f32 = true_latlon.float()
+        weights_f32 = weights.float()
+
         # Compute log-probability for each mixture component
         log_probs = []
         for k in range(K):
             comp_dist = MultivariateNormal(
-                loc=means[:, k, :],  # (B, 2)
-                covariance_matrix=covariances[:, k, :, :],  # (B, 2, 2)
+                loc=means_f32[:, k, :],  # (B, 2)
+                covariance_matrix=covariances_f32[:, k, :, :],  # (B, 2, 2)
             )
-            log_prob_k = comp_dist.log_prob(true_latlon)  # (B,)
+            log_prob_k = comp_dist.log_prob(true_latlon_f32)  # (B,)
             log_probs.append(log_prob_k)
 
         # Stack: (B, K)
         log_probs_stack = torch.stack(log_probs, dim=1)
-        log_weights = torch.log(weights + 1e-8)  # (B, K)
+        log_weights = torch.log(weights_f32 + 1e-8)  # (B, K)
 
         # Log-sum-exp for numerical stability: log(sum_k w_k * exp(log_prob_k))
         # = log(sum_k exp(log_weights_k + log_prob_k))
