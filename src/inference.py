@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from datasets import StateIndexMapper, StreetViewDataset, collate_streetview
 
 from models.dinov3 import DinoV3Encoder
+from models.streetclip import StreetCLIPEncoder
 from models.fusion_transformer import DirectionalFusionTransformer
 from models.geo_geussr import (
     GeoGuessrModel,
@@ -54,6 +55,7 @@ def main() -> None:
         )
 
     config = ckpt["config"]
+    encoder_type = config.get("encoder_type", "dinov3")
     hf_model_id = config["hf_model_id"]
     state_mapping = config["state_mapping"]
     embed_dim = config["embed_dim"]
@@ -69,6 +71,9 @@ def main() -> None:
     fusion_layers = config.get("fusion_layers", 2)
     fusion_heads = config.get("fusion_heads", 8)
     fusion_dropout = config.get("fusion_dropout", 0.1)
+    lora_rank = config.get("lora_rank", 8)
+    lora_alpha = config.get("lora_alpha", 16.0)
+    lora_layers = config.get("lora_layers", 4)
 
     # Load centroids (from checkpoint metadata or explicit path)
     if "centroids_path" in ckpt:
@@ -99,8 +104,13 @@ def main() -> None:
         state_mapper.num_states == num_states
     ), f"State mapping mismatch: {state_mapper.num_states} vs {num_states}"
 
-    # Load DINOv3 preprocessing params
-    pp = DinoV3Encoder.processor_params(hf_model_id)
+    # Load encoder preprocessing params
+    if encoder_type == "dinov3":
+        pp = DinoV3Encoder.processor_params(hf_model_id)
+    elif encoder_type == "streetclip":
+        pp = StreetCLIPEncoder.processor_params(hf_model_id)
+    else:
+        raise ValueError(f"Unknown encoder_type in checkpoint: {encoder_type}")
     ds = StreetViewDataset(
         csv_path=test_csv,
         images_dir=test_images,
@@ -121,11 +131,28 @@ def main() -> None:
 
     # Rebuild model from checkpoint config
     print("Building model from checkpoint configuration...")
-    encoder = DinoV3Encoder(
-        model_id=hf_model_id,
-        freeze=True,
-        use_lora=True,  # Checkpoint should have LoRA if it was trained with it
-    )
+    if encoder_type == "dinov3":
+        encoder = DinoV3Encoder(
+            model_id=hf_model_id,
+            freeze=True,
+            use_lora=True,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_layers=lora_layers,
+            trainable_layers=0,
+        )
+    elif encoder_type == "streetclip":
+        encoder = StreetCLIPEncoder(
+            model_id=hf_model_id,
+            freeze=True,
+            use_lora=True,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_layers=lora_layers,
+            trainable_layers=0,
+        )
+    else:
+        raise ValueError(f"Unknown encoder_type in checkpoint: {encoder_type}")
     assert encoder.embed_dim == embed_dim, "Embed dim mismatch"
 
     fusion = DirectionalFusionTransformer(

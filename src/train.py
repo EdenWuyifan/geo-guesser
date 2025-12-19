@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, random_split
 from datasets import StateIndexMapper, StreetViewDataset, collate_streetview
 
 from models.dinov3 import DinoV3Encoder  # HuggingFace-backed encoder
+from models.streetclip import StreetCLIPEncoder
 from models.fusion_transformer import DirectionalFusionTransformer
 from models.geo_geussr import (
     GeoGuessrModel,
@@ -161,12 +162,20 @@ def main() -> None:
 
         # DINOv3 / mapping
         ap.add_argument(
+            "--encoder_type",
+            type=str,
+            default="dinov3",
+            choices=["dinov3", "streetclip"],
+            help="Backbone encoder: 'dinov3' (default) or 'streetclip' (CLIP ViT-L/14@336 pretrained for geolocalization).",
+        )
+        ap.add_argument(
             "--hf_model_id",
             type=str,
             default="facebook/dinov3-vit7b16-pretrain-lvd1689m",
-            help="HuggingFace model id for DINOv3. "
-            "Faster alternatives: 'facebook/dinov2-vitb14' (base), "
-            "'facebook/dinov2-vits14' (small, fastest)",
+            help="HuggingFace model id for the encoder. "
+            "For --encoder_type dinov3: 'facebook/dinov3-vit7b16-pretrain-lvd1689m' (default). "
+            "For --encoder_type streetclip: 'geolocal/StreetCLIP'. "
+            "Faster DINO alternatives: 'facebook/dinov2-vitb14' (base), 'facebook/dinov2-vits14' (small).",
         )
         ap.add_argument(
             "--compile_model",
@@ -238,6 +247,19 @@ def main() -> None:
     ap = build_arg_parser()
     args = ap.parse_args()
 
+    # Convenience default: if the user switches encoder_type but leaves the default DINO id,
+    # automatically pick the StreetCLIP model id.
+    if (
+        args.encoder_type == "streetclip"
+        and args.hf_model_id == "facebook/dinov3-vit7b16-pretrain-lvd1689m"
+    ):
+        log_step(
+            "Note",
+            "Using StreetCLIP encoder; switching --hf_model_id to 'geolocal/StreetCLIP' (was DINO default).",
+            level="warning",
+        )
+        args.hf_model_id = "geolocal/StreetCLIP"
+
     # Defaults for new implementations (kept internal to avoid expanding CLI surface):
     # - Geo: mixture-of-Gaussians regression (multi-modal) with optional cell aux
     # - Encoder: LoRA + partial unfreeze of last blocks with LLRD
@@ -265,6 +287,8 @@ def main() -> None:
     log_step("", f"  Learning rate: {args.lr}")
     log_step("", f"  Number of cells: {args.num_cells}")
     log_step("", f"  Geo method: {args.geo_method}")
+    log_step("", f"  Encoder type: {args.encoder_type}")
+    log_step("", f"  Encoder model id: {args.hf_model_id}")
     log_step(
         "",
         f"  Geo head: {geo_head_type} (K={num_components}, cell_aux={mixture_use_cell_aux})",
@@ -335,9 +359,14 @@ def main() -> None:
     num_states = state_mapper.num_states
     log_step("Success", f"Loaded {num_states} states")
 
-    # --- DINOv3 preprocessing params (mean/std/size) from HF processor
-    log_step("DINOv3 Config", f"Fetching processor params for {args.hf_model_id}...")
-    pp = DinoV3Encoder.processor_params(args.hf_model_id)
+    # --- Encoder preprocessing params (mean/std/size) from HF processor
+    log_step("Encoder Config", f"Fetching processor params for {args.hf_model_id}...")
+    if args.encoder_type == "dinov3":
+        pp = DinoV3Encoder.processor_params(args.hf_model_id)
+    elif args.encoder_type == "streetclip":
+        pp = StreetCLIPEncoder.processor_params(args.hf_model_id)
+    else:
+        raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
     image_size = pp["image_size"]
     log_step(
         "Success",
@@ -455,7 +484,10 @@ def main() -> None:
 
     log_section("🧠 Model Initialization")
 
-    log_step("Encoder", f"Loading DINOv3 encoder: {args.hf_model_id}...")
+    log_step(
+        "Encoder",
+        f"Loading encoder ({args.encoder_type}): {args.hf_model_id}...",
+    )
     # Use bfloat16 for large models when supported (saves memory; stable without GradScaler)
     torch_dtype = (
         torch.bfloat16
@@ -471,16 +503,30 @@ def main() -> None:
         "LoRA",
         f"Adding LoRA adapters (rank={lora_rank}, alpha={lora_alpha}, layers={lora_layers})...",
     )
-    encoder = DinoV3Encoder(
-        model_id=args.hf_model_id,
-        freeze=True,  # Start frozen; optionally unfreeze last blocks below
-        torch_dtype=torch_dtype,
-        use_lora=True,
-        lora_rank=lora_rank,
-        lora_alpha=lora_alpha,
-        lora_layers=lora_layers,
-        trainable_layers=encoder_trainable_layers,
-    ).to(device)
+    if args.encoder_type == "dinov3":
+        encoder = DinoV3Encoder(
+            model_id=args.hf_model_id,
+            freeze=True,  # Start frozen; optionally unfreeze last blocks below
+            torch_dtype=torch_dtype,
+            use_lora=True,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_layers=lora_layers,
+            trainable_layers=encoder_trainable_layers,
+        ).to(device)
+    elif args.encoder_type == "streetclip":
+        encoder = StreetCLIPEncoder(
+            model_id=args.hf_model_id,
+            freeze=True,  # Start frozen; optionally unfreeze last blocks below
+            torch_dtype=torch_dtype,
+            use_lora=True,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_layers=lora_layers,
+            trainable_layers=encoder_trainable_layers,
+        ).to(device)
+    else:
+        raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
     embed_dim = encoder.embed_dim
     log_step("Success", f"Encoder embed dimension: {embed_dim}")
     trainable_blocks = encoder.get_trainable_block_indices()
@@ -493,7 +539,9 @@ def main() -> None:
         log_step("Encoder", "Backbone frozen (only LoRA adapters trainable)")
 
     # Warn if using a very large model
-    if "7b" in args.hf_model_id.lower() or "giant" in args.hf_model_id.lower():
+    if args.encoder_type == "dinov3" and (
+        "7b" in args.hf_model_id.lower() or "giant" in args.hf_model_id.lower()
+    ):
         log_step(
             "Warning",
             "Using a large model (7B+). Consider using a smaller variant for faster training:",
@@ -807,9 +855,19 @@ def main() -> None:
         ckpt_geo_type = ckpt_config.get(
             "geo_head_type", "mixture" if ckpt_use_mixture else "cell"
         )
+        ckpt_encoder_type = ckpt_config.get("encoder_type", "dinov3")
+        ckpt_hf_model_id = ckpt_config.get("hf_model_id", None)
 
         # Collect compatibility issues instead of hard-failing so we can start fresh
         compatibility_errors = []
+        if ckpt_encoder_type != args.encoder_type:
+            compatibility_errors.append(
+                f"encoder_type={ckpt_encoder_type} vs {args.encoder_type}"
+            )
+        if ckpt_hf_model_id is not None and ckpt_hf_model_id != args.hf_model_id:
+            compatibility_errors.append(
+                f"hf_model_id={ckpt_hf_model_id} vs {args.hf_model_id}"
+            )
         if ckpt_embed_dim != embed_dim:
             compatibility_errors.append(f"embed_dim={ckpt_embed_dim} vs {embed_dim}")
         if ckpt_num_states != num_states:
@@ -1165,6 +1223,7 @@ def main() -> None:
                         "optimizer": optim.state_dict(),
                         "scaler": scaler.state_dict(),
                         "config": {
+                            "encoder_type": args.encoder_type,
                             "hf_model_id": args.hf_model_id,
                             "state_mapping": args.state_mapping,
                             "embed_dim": embed_dim,
@@ -1224,6 +1283,7 @@ def main() -> None:
                 "optimizer": optim.state_dict(),
                 "scaler": scaler.state_dict(),
                 "config": {
+                    "encoder_type": args.encoder_type,
                     "hf_model_id": args.hf_model_id,
                     "state_mapping": args.state_mapping,
                     "embed_dim": embed_dim,

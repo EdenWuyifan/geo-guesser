@@ -215,3 +215,30 @@ Yes. GPS contributes 30% of the final score.
 
 **Are all US longitudes negative?**
 For US locations, typically yes (West longitudes are negative), but your validation range is global.
+
+---
+
+## Training (StreetCLIP)
+
+This repo supports fine-tuning StreetCLIP (`geolocal/StreetCLIP`) as the image encoder (4-view fusion + state classification + GPS regression).
+
+```bash
+.venv/bin/python src/train.py \
+  --encoder_type streetclip \
+  --hf_model_id geolocal/StreetCLIP \
+  --data_dir data \
+  --out_dir checkpoints_streetclip \
+  --epochs 5 \
+  --batch_size 32 \
+  --gradient_accumulation_steps 4 \
+  --val_split 0.05
+```
+
+Generate a submission from a checkpoint:
+
+```bash
+.venv/bin/python src/inference.py \
+  --ckpt checkpoints_streetclip/model_best.pt \
+  --data_dir data \
+  --out_csv submission.csv
+```
