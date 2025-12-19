@@ -185,7 +185,19 @@ def main() -> None:
     ).to(device)
 
     # Load model weights
-    model.load_state_dict(ckpt["model"], strict=True)
+    try:
+        model.load_state_dict(ckpt["model"], strict=True)
+    except RuntimeError as e:
+        incompatible = model.load_state_dict(ckpt["model"], strict=False)
+        missing = list(getattr(incompatible, "missing_keys", []))
+        unexpected = list(getattr(incompatible, "unexpected_keys", []))
+        allowed_missing = [k for k in missing if (".lora_A" in k or ".lora_B" in k)]
+        disallowed_missing = [k for k in missing if k not in set(allowed_missing)]
+        if unexpected or disallowed_missing:
+            raise
+        print(
+            f"Warning: checkpoint missing {len(allowed_missing)} LoRA params; running inference with LoRA initialized from scratch."
+        )
     model.eval()
     print("Model loaded successfully!")
 

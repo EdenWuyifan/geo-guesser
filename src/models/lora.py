@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class LoRALinear(nn.Module):
@@ -27,25 +30,30 @@ class LoRALinear(nn.Module):
             dropout: Dropout probability for LoRA adapters
         """
         super().__init__()
-        self.linear = linear
+        if rank <= 0:
+            raise ValueError("rank must be > 0")
+
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
         self.rank = rank
         self.alpha = alpha
         self.scaling = alpha / rank
 
-        # Freeze original weights
-        for param in self.linear.parameters():
-            param.requires_grad = False
+        # Keep base weights under the standard "weight"/"bias" names so existing
+        # checkpoints (trained without LoRA) can still load cleanly.
+        self.weight = nn.Parameter(linear.weight.detach().clone(), requires_grad=False)
+        if linear.bias is None:
+            self.register_parameter("bias", None)
+        else:
+            self.bias = nn.Parameter(linear.bias.detach().clone(), requires_grad=False)
 
         # LoRA adapters: B (down) and A (up)
-        in_features = linear.in_features
-        out_features = linear.out_features
-
-        self.lora_A = nn.Parameter(torch.zeros(rank, in_features))
-        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+        self.lora_A = nn.Parameter(self.weight.new_zeros(rank, self.in_features))
+        self.lora_B = nn.Parameter(self.weight.new_zeros(self.out_features, rank))
         self.lora_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
         # Initialize: A with Kaiming uniform, B with zeros
-        nn.init.kaiming_uniform_(self.lora_A, a=torch.sqrt(torch.tensor(5.0)))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -53,7 +61,7 @@ class LoRALinear(nn.Module):
         Forward pass: W @ x + (B @ A) @ x * scaling
         """
         # Original output
-        out = self.linear(x)
+        out = F.linear(x, self.weight, self.bias)
 
         # LoRA adaptation
         lora_out = self.lora_dropout(x) @ self.lora_A.T  # (..., rank)

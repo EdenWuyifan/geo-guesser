@@ -174,9 +174,18 @@ class StreetCLIPEncoder(nn.Module):
         x: (B, V, 3, H, W) already normalized/resized.
         """
         b, v, c, h, w = x.shape
+        interpolate_pos_encoding = False
+        cfg_image_size = getattr(self.model.config, "image_size", None)
+        if cfg_image_size is not None:
+            cfg_image_size = int(cfg_image_size)
+            if h != cfg_image_size or w != cfg_image_size:
+                interpolate_pos_encoding = True
         x = x.view(b * v, c, h, w)
 
-        vision_out = self.model(pixel_values=x)
+        vision_out = self.model(
+            pixel_values=x,
+            interpolate_pos_encoding=interpolate_pos_encoding,
+        )
         embeds = vision_out.image_embeds
         if self.normalize:
             embeds = F.normalize(embeds, p=2, dim=-1)

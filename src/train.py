@@ -126,6 +126,12 @@ def main() -> None:
         )
         ap.add_argument("--lr", type=float, default=3e-4)
         ap.add_argument(
+            "--grad_clip_norm",
+            type=float,
+            default=0.0,
+            help="Global gradient clipping max-norm (0 disables).",
+        )
+        ap.add_argument(
             "--gradient_accumulation_steps",
             type=int,
             default=1,
@@ -193,6 +199,12 @@ def main() -> None:
             help="Method for building geo cells: 's2' or 'kmeans3d'.",
         )
         ap.add_argument(
+            "--s2_level",
+            type=int,
+            default=6,
+            help="S2 level when --geo_method s2 (higher = more/smaller cells).",
+        )
+        ap.add_argument(
             "--num_cells",
             type=int,
             default=1024,
@@ -222,11 +234,31 @@ def main() -> None:
             default=0.1,
             help="Weight for self-supervised geo-distance contrastive loss.",
         )
+        ap.add_argument(
+            "--self_sup_warmup_epochs",
+            type=int,
+            default=0,
+            help="Linearly ramp self-supervised loss from 0→1 over this many epochs (0 disables).",
+        )
+
+        ap.add_argument(
+            "--image_size",
+            type=int,
+            default=None,
+            help="Override encoder-recommended image size (e.g., 224/280 for CLIP ViT-L/14). "
+            "Leave unset to use the encoder's default.",
+        )
 
         # Fusion
         ap.add_argument("--fusion_layers", type=int, default=2)
         ap.add_argument("--fusion_heads", type=int, default=8)
         ap.add_argument("--fusion_dropout", type=float, default=0.1)
+        ap.add_argument(
+            "--view_dropout_prob",
+            type=float,
+            default=0.15,
+            help="Probability of dropping 1-2 views in fusion during training.",
+        )
         ap.add_argument(
             "--num_workers",
             type=int,
@@ -287,6 +319,8 @@ def main() -> None:
     log_step("", f"  Learning rate: {args.lr}")
     log_step("", f"  Number of cells: {args.num_cells}")
     log_step("", f"  Geo method: {args.geo_method}")
+    if args.geo_method == "s2":
+        log_step("", f"  S2 level: {args.s2_level}")
     log_step("", f"  Encoder type: {args.encoder_type}")
     log_step("", f"  Encoder model id: {args.hf_model_id}")
     log_step(
@@ -367,11 +401,18 @@ def main() -> None:
         pp = StreetCLIPEncoder.processor_params(args.hf_model_id)
     else:
         raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
-    image_size = pp["image_size"]
+    image_size = args.image_size if args.image_size is not None else pp["image_size"]
     log_step(
         "Success",
         f"Image size: {image_size}x{image_size}, Mean: {pp['mean']}, Std: {pp['std']}",
     )
+    if args.encoder_type == "streetclip" and (image_size % 14) != 0:
+        log_step(
+            "Note",
+            f"StreetCLIP is typically ViT-L/14; image_size={image_size} is not divisible by 14. "
+            "Consider 224/280/336 to avoid patch cropping.",
+            level="warning",
+        )
     if image_size > 224:
         log_step(
             "Note",
@@ -387,7 +428,7 @@ def main() -> None:
         images_dir=train_images,
         is_train=True,
         state_mapper=state_mapper,
-        image_size=pp["image_size"],
+        image_size=image_size,
         mean=pp["mean"],
         std=pp["std"],
     )
@@ -461,7 +502,10 @@ def main() -> None:
     log_section("🗺️  Geo-Cell Building")
     log_step("Building", f"Creating geo cells using method: {args.geo_method}...")
     geo_cells = build_geo_cells(
-        train_csv, method=args.geo_method, num_cells=args.num_cells
+        train_csv,
+        method=args.geo_method,
+        s2_level=args.s2_level,
+        num_cells=args.num_cells,
     )
     centroids_np = geo_cells.centroids_latlon
     cell_ids_np = geo_cells.cell_ids
@@ -529,6 +573,24 @@ def main() -> None:
         raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
     embed_dim = encoder.embed_dim
     log_step("Success", f"Encoder embed dimension: {embed_dim}")
+    if getattr(encoder, "use_lora", False):
+        lora_trainable = [
+            p
+            for n, p in encoder.named_parameters()
+            if "lora" in n.lower() and p.requires_grad
+        ]
+        if lora_trainable:
+            lora_numel = sum(p.numel() for p in lora_trainable)
+            log_step(
+                "LoRA",
+                f"Trainable LoRA params: {lora_numel:,} ({len(lora_trainable)} tensors)",
+            )
+        else:
+            log_step(
+                "Warning",
+                "LoRA requested but no trainable LoRA params were found; adapters may not have been injected.",
+                level="warning",
+            )
     trainable_blocks = encoder.get_trainable_block_indices()
     if trainable_blocks:
         log_step(
@@ -564,7 +626,7 @@ def main() -> None:
         f"  Layers: {args.fusion_layers}, Heads: {args.fusion_heads}, Dropout: {args.fusion_dropout}",
     )
     # Enable view dropout for training robustness (drop 1-2 views randomly)
-    view_dropout_prob = 0.15  # 15% chance to drop views per sample
+    view_dropout_prob = float(args.view_dropout_prob)
     log_step("", f"  View dropout: {view_dropout_prob:.1%} (for training robustness)")
     fusion = DirectionalFusionTransformer(
         embed_dim=embed_dim,
@@ -709,6 +771,11 @@ def main() -> None:
         "",
         f"  Geo-distance contrastive: λ={args.lambda_geo_distance} (nearby=positive, far=negative)",
     )
+    if args.self_sup_warmup_epochs and args.self_sup_warmup_epochs > 0:
+        log_step(
+            "",
+            f"  Self-supervised warmup: {args.self_sup_warmup_epochs} epochs (ramp 0→1)",
+        )
     self_sup_loss_fn = SelfSupervisedLoss(
         lambda_view_consistency=args.lambda_view_consistency,
         lambda_geo_distance=args.lambda_geo_distance,
@@ -908,16 +975,50 @@ def main() -> None:
             start_epoch = 1
             log_step("Starting", f"Training for {args.epochs} epochs on {device}")
         else:
-            # Load model state
-            model.load_state_dict(ckpt["model"], strict=True)
+            # Load model state (allow older checkpoints missing LoRA params)
+            try:
+                model.load_state_dict(ckpt["model"], strict=True)
+            except RuntimeError as e:
+                incompatible = model.load_state_dict(ckpt["model"], strict=False)
+                missing = list(getattr(incompatible, "missing_keys", []))
+                unexpected = list(getattr(incompatible, "unexpected_keys", []))
+
+                allowed_missing = [
+                    k for k in missing if (".lora_A" in k or ".lora_B" in k)
+                ]
+                disallowed_missing = [
+                    k for k in missing if k not in set(allowed_missing)
+                ]
+                if unexpected or disallowed_missing:
+                    raise
+
+                log_step(
+                    "Warning",
+                    f"Checkpoint missing {len(allowed_missing)} LoRA params; initializing LoRA from scratch.",
+                    level="warning",
+                )
 
             # Load optimizer and scaler state if available
             if "optimizer" in ckpt:
-                optim.load_state_dict(ckpt["optimizer"])
-                log_step("Success", "Loaded optimizer state")
+                try:
+                    optim.load_state_dict(ckpt["optimizer"])
+                    log_step("Success", "Loaded optimizer state")
+                except Exception as e:
+                    log_step(
+                        "Warning",
+                        f"Failed to load optimizer state (param groups may differ): {e}",
+                        level="warning",
+                    )
             if "scaler" in ckpt:
-                scaler.load_state_dict(ckpt["scaler"])
-                log_step("Success", "Loaded scaler state")
+                try:
+                    scaler.load_state_dict(ckpt["scaler"])
+                    log_step("Success", "Loaded scaler state")
+                except Exception as e:
+                    log_step(
+                        "Warning",
+                        f"Failed to load GradScaler state: {e}",
+                        level="warning",
+                    )
 
             # Determine starting epoch
             if "epoch" in ckpt:
@@ -1125,7 +1226,10 @@ def main() -> None:
                 )
 
                 # Combine supervised and self-supervised losses
-                total_loss = loss_out.total + self_sup_losses["total"]
+                self_sup_scale = 1.0
+                if args.self_sup_warmup_epochs and args.self_sup_warmup_epochs > 0:
+                    self_sup_scale = min(1.0, epoch / args.self_sup_warmup_epochs)
+                total_loss = loss_out.total + self_sup_losses["total"] * self_sup_scale
 
             # Scale loss by accumulation steps for correct averaging
             scaled_loss = total_loss / args.gradient_accumulation_steps
@@ -1138,6 +1242,12 @@ def main() -> None:
             if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (
                 batch_idx + 1
             ) == len(train_loader):
+                if args.grad_clip_norm and args.grad_clip_norm > 0:
+                    if scaler.is_enabled():
+                        scaler.unscale_(optim)
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_norm=args.grad_clip_norm
+                    )
                 if scaler.is_enabled():
                     scaler.step(optim)
                     scaler.update()
