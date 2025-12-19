@@ -1,6 +1,7 @@
 kaggle_dataset
 *.ext3
 *.zip
+*.csv
 
 .env
 .venv
