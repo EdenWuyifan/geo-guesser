@@ -258,11 +258,11 @@ DINOv2 uses the same training script; just switch the encoder type + model id:
 ```bash
 .venv/bin/python src/train.py \
   --encoder_type dinov2 \
-  --hf_model_id facebook/dinov2-vitb14 \
+  --hf_model_id facebook/dinov2-base \
   --data_dir data \
   --out_dir checkpoints_dinov2 \
   --epochs 5 \
-  --batch_size 32 \
+  --batch_size 128 \
   --gradient_accumulation_steps 4 \
   --val_split 0.05
 ```
