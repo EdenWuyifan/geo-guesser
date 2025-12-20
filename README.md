@@ -218,9 +218,160 @@ For US locations, typically yes (West longitudes are negative), but your validat
 
 ---
 
-## Training (StreetCLIP)
+## Training & Inference Workflow (Homework Submission)
 
-This repo supports fine-tuning StreetCLIP (`geolocal/StreetCLIP`) as the image encoder (4-view fusion + state classification + GPS regression).
+Our final workflow is a **two-model pipeline**:
+
+1. **GPS regression (latitude/longitude)** via a **DINOv3** backbone trained in this repo: `src/train.py` → `src/inference.py`
+2. **State top-5 recommendations** via **OSV5M baseline** (`osv5m/baseline`): https://huggingface.co/osv5m/baseline
+
+The final Kaggle submission is produced by **merging**:
+- `predicted_latitude`, `predicted_longitude` from the DINOv3 model
+- `predicted_state_idx_1..5` from the OSV5M state recommender
+
+### 0) Environment / Data
+
+- Create env + install deps: `pip install -r requirements.txt`
+- Put the dataset under `data/` (default layout described above).
+- First run will download Hugging Face weights for DINOv3 / OSV5M (unless already cached).
+
+### 1) Train DINOv3 for GPS (this repo)
+
+We train a 4-view fusion model with a DINOv3 encoder (frozen backbone + LoRA adapters by default) and a GPS head.
+
+```bash
+.venv/bin/python src/train.py \
+  --encoder_type dinov3 \
+  --hf_model_id facebook/dinov3-vit7b16-pretrain-lvd1689m \
+  --data_dir data \
+  --out_dir checkpoints_dinov3 \
+  --epochs 5 \
+  --batch_size 32 \
+  --gradient_accumulation_steps 4 \
+  --val_split 0.05
+```
+
+Multi-GPU (DDP) example (2 GPUs). `--batch_size` is per-GPU:
+
+```bash
+.venv/bin/torchrun --standalone --nproc_per_node=2 src/train.py \
+  --encoder_type dinov3 \
+  --hf_model_id facebook/dinov3-vit7b16-pretrain-lvd1689m \
+  --data_dir data \
+  --out_dir checkpoints_dinov3_ddp \
+  --epochs 5 \
+  --batch_size 32 \
+  --gradient_accumulation_steps 4 \
+  --val_split 0.05
+```
+
+Slurm example (`sbatch --gres=gpu:2`): run a single multi-process job that uses both GPUs:
+
+```bash
+srun --ntasks=1 --cpus-per-task=12 --gres=gpu:2 \
+  .venv/bin/torchrun --standalone --nproc_per_node=2 src/train.py \
+    --encoder_type dinov3 \
+    --hf_model_id facebook/dinov3-vit7b16-pretrain-lvd1689m \
+    --data_dir data \
+    --out_dir checkpoints_dinov3_ddp \
+    --epochs 5 \
+    --batch_size 32 \
+    --gradient_accumulation_steps 4 \
+    --val_split 0.05
+```
+
+Outputs:
+- `checkpoints_dinov3/model_epoch_*.pt` (per-epoch checkpoints)
+- `checkpoints_dinov3/model_best.pt` (best checkpoint by validation metric)
+
+### 2) Run DINOv3 inference (this repo)
+
+This writes a full submission CSV. In our final submission, we **keep only the lat/lon columns** from this file.
+
+```bash
+.venv/bin/python src/inference.py \
+  --ckpt checkpoints_dinov3/model_best.pt \
+  --data_dir data \
+  --out_csv submission_dinov3.csv
+```
+
+Multi-GPU inference (DDP) example (2 GPUs):
+
+```bash
+.venv/bin/torchrun --standalone --nproc_per_node=2 src/inference.py \
+  --ckpt checkpoints_dinov3/model_best.pt \
+  --data_dir data \
+  --out_csv submission_dinov3.csv
+```
+
+Slurm example (2 GPUs):
+
+```bash
+srun --ntasks=1 --cpus-per-task=12 --gres=gpu:2 \
+  .venv/bin/torchrun --standalone --nproc_per_node=2 src/inference.py \
+    --ckpt checkpoints_dinov3/model_best.pt \
+    --data_dir data \
+    --out_csv submission_dinov3.csv
+```
+
+### 3) Train/Run OSV5M for state top-5 (external; runs inside osv5m repo)
+
+We use the pretrained OSV5M geolocalization backbone (`osv5m/baseline`) and train a lightweight state classifier head on top.
+The code we used for this finetune is a standalone script that must be executed with the **OSV5M GitHub repo on `PYTHONPATH`**
+(it imports `from models.huggingface import Geolocalizer` from that repo).
+
+High-level steps performed by the script:
+- Read `train_ground_truth.csv`, build a train/val split, and map sparse `state_idx` → contiguous class IDs
+- For each sample, extract OSV5M CLS embeddings for the 4 views, mean-pool, and train a linear head (optionally unfreezing the backbone later)
+- Select `best.pt` by validation top-1; then run inference on `sample_submission.csv` to write top-5 `state_idx` columns
+
+Example (train + write a state-only submission):
+```bash
+python osv5m_state_finetune_script.py \
+  --data_dir /path/to/geo-guesser/data \
+  --state_mapping /path/to/geo-guesser/data/state_mapping.csv \
+  --out_dir checkpoints_state \
+  --epochs 3 \
+  --make_submission \
+  --submission_csv submission_osv5m.csv \
+  --fill_latlon nan
+```
+
+Example (inference-only from a checkpoint):
+```bash
+python osv5m_state_finetune_script.py \
+  --data_dir /path/to/geo-guesser/data \
+  --state_mapping /path/to/geo-guesser/data/state_mapping.csv \
+  --out_dir checkpoints_state \
+  --inference_only \
+  --ckpt_path checkpoints_state/best.pt \
+  --submission_csv submission_osv5m.csv \
+  --fill_latlon nan
+```
+
+### 4) Merge OSV5M states + DINOv3 GPS into the final submission
+
+Both CSVs contain `sample_id`, so we merge by `sample_id` and copy over the columns we want:
+
+```bash
+python - <<'PY'
+import pandas as pd
+
+gps = pd.read_csv("submission_dinov3.csv")
+states = pd.read_csv("submission_osv5m.csv").set_index("sample_id")
+
+out = gps.copy()
+for c in [f"predicted_state_idx_{i}" for i in range(1, 6)]:
+    out[c] = states.loc[gps["sample_id"], c].values
+
+out.to_csv("submission_final.csv", index=False)
+print("Wrote submission_final.csv")
+PY
+```
+
+### Optional: StreetCLIP end-to-end (single model baseline)
+
+This repo also supports fine-tuning StreetCLIP (`geolocal/StreetCLIP`) as the encoder (4-view fusion + state classification + GPS regression).
 
 ```bash
 .venv/bin/python src/train.py \
@@ -234,11 +385,34 @@ This repo supports fine-tuning StreetCLIP (`geolocal/StreetCLIP`) as the image e
   --val_split 0.05
 ```
 
+Multi-GPU (DDP) example (2 GPUs). `--batch_size` is per-GPU:
+
+```bash
+.venv/bin/torchrun --standalone --nproc_per_node=2 src/train.py \
+  --encoder_type streetclip \
+  --hf_model_id geolocal/StreetCLIP \
+  --data_dir data \
+  --out_dir checkpoints_streetclip_ddp \
+  --epochs 5 \
+  --batch_size 32 \
+  --gradient_accumulation_steps 4 \
+  --val_split 0.05
+```
+
 Generate a submission from a checkpoint:
 
 ```bash
 .venv/bin/python src/inference.py \
   --ckpt checkpoints_streetclip/model_best.pt \
   --data_dir data \
-  --out_csv submission.csv
+  --out_csv submission_streetclip.csv
+```
+
+Multi-GPU inference (DDP) example (2 GPUs):
+
+```bash
+.venv/bin/torchrun --standalone --nproc_per_node=2 src/inference.py \
+  --ckpt checkpoints_streetclip/model_best.pt \
+  --data_dir data \
+  --out_csv submission_streetclip.csv
 ```

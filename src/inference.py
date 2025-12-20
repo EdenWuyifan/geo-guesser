@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from datasets import StateIndexMapper, StreetViewDataset, collate_streetview
 
@@ -18,6 +19,14 @@ from models.geo_geussr import (
     GeoGuessrModel,
     StateHead,
     MixtureGeoHead,
+)
+
+from dist_utils import (
+    DistState,
+    all_gather_object,
+    init_distributed,
+    is_main_process,
+    destroy_process_group,
 )
 
 
@@ -44,8 +53,10 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"Loading checkpoint from: {args.ckpt}")
+    dist_state: DistState = init_distributed(args.device)
+    device = dist_state.device
+    if is_main_process():
+        print(f"Loading checkpoint from: {args.ckpt}")
 
     # Load checkpoint and extract configuration
     ckpt = torch.load(args.ckpt, map_location="cpu")
@@ -87,7 +98,8 @@ def main() -> None:
                 f"Could not find geo cell centroids. Expected at: {centroids_path}"
             )
 
-    print(f"Loading geo cell centroids from: {centroids_path}")
+    if is_main_process():
+        print(f"Loading geo cell centroids from: {centroids_path}")
     centroids = np.load(centroids_path)  # (num_cells, 2)
     centroids_tensor = torch.tensor(
         centroids, device=device, dtype=torch.float32
@@ -120,17 +132,30 @@ def main() -> None:
         mean=pp["mean"],
         std=pp["std"],
     )
+    sampler = (
+        DistributedSampler(
+            ds,
+            num_replicas=dist_state.world_size,
+            rank=dist_state.rank,
+            shuffle=False,
+            drop_last=False,
+        )
+        if dist_state.distributed
+        else None
+    )
     loader = DataLoader(
         ds,
         batch_size=args.batch_size,
         shuffle=False,
+        sampler=sampler,
         num_workers=4,
         pin_memory=(device.type == "cuda"),
         collate_fn=collate_streetview,
     )
 
     # Rebuild model from checkpoint config
-    print("Building model from checkpoint configuration...")
+    if is_main_process():
+        print("Building model from checkpoint configuration...")
     if encoder_type == "dinov3":
         encoder = DinoV3Encoder(
             model_id=hf_model_id,
@@ -195,11 +220,13 @@ def main() -> None:
         disallowed_missing = [k for k in missing if k not in set(allowed_missing)]
         if unexpected or disallowed_missing:
             raise
-        print(
-            f"Warning: checkpoint missing {len(allowed_missing)} LoRA params; running inference with LoRA initialized from scratch."
-        )
+        if is_main_process():
+            print(
+                f"Warning: checkpoint missing {len(allowed_missing)} LoRA params; running inference with LoRA initialized from scratch."
+            )
     model.eval()
-    print("Model loaded successfully!")
+    if is_main_process():
+        print("Model loaded successfully!")
 
     # Required columns for submission
     required_cols = [
@@ -216,9 +243,6 @@ def main() -> None:
         "predicted_latitude",
         "predicted_longitude",
     ]
-
-    # Read template to get sample_id and image paths
-    template = pd.read_csv(test_csv)
 
     all_ids: List[np.ndarray] = []
     all_state_top5_idx: List[np.ndarray] = []
@@ -264,56 +288,69 @@ def main() -> None:
     top5_idx = np.concatenate(all_state_top5_idx, axis=0)
     latlon = np.concatenate(all_latlon, axis=0)
 
-    # Create submission dataframe with only required columns
-    # Start with template data (sample_id and image paths)
-    submission = template[
-        ["sample_id", "image_north", "image_east", "image_south", "image_west"]
-    ].copy()
+    gathered = all_gather_object((ids, top5_idx, latlon), dist_state)
+    if is_main_process():
+        ids = np.concatenate([g[0] for g in gathered], axis=0)
+        top5_idx = np.concatenate([g[1] for g in gathered], axis=0)
+        latlon = np.concatenate([g[2] for g in gathered], axis=0)
 
-    # Initialize prediction columns
-    for col in [
-        "predicted_state_idx_1",
-        "predicted_state_idx_2",
-        "predicted_state_idx_3",
-        "predicted_state_idx_4",
-        "predicted_state_idx_5",
-        "predicted_latitude",
-        "predicted_longitude",
-    ]:
-        submission[col] = np.nan
+        # Read template to get sample_id and image paths
+        template = pd.read_csv(test_csv)
 
-    # Write predictions back by sample_id alignment
-    id_to_row = {int(sid): i for i, sid in enumerate(submission["sample_id"].values)}
-    for sid, t5, ll in zip(ids, top5_idx, latlon):
-        r = id_to_row[int(sid)]
-        # Ensure state IDs are integers
-        submission.loc[r, "predicted_state_idx_1"] = int(t5[0])
-        submission.loc[r, "predicted_state_idx_2"] = int(t5[1])
-        submission.loc[r, "predicted_state_idx_3"] = int(t5[2])
-        submission.loc[r, "predicted_state_idx_4"] = int(t5[3])
-        submission.loc[r, "predicted_state_idx_5"] = int(t5[4])
-        submission.loc[r, "predicted_latitude"] = float(ll[0])
-        submission.loc[r, "predicted_longitude"] = float(ll[1])
+        # Create submission dataframe with only required columns
+        # Start with template data (sample_id and image paths)
+        submission = template[
+            ["sample_id", "image_north", "image_east", "image_south", "image_west"]
+        ].copy()
 
-    # Ensure state ID columns are integers (convert any remaining NaN/invalid to 0)
-    state_cols = [
-        "predicted_state_idx_1",
-        "predicted_state_idx_2",
-        "predicted_state_idx_3",
-        "predicted_state_idx_4",
-        "predicted_state_idx_5",
-    ]
-    for col in state_cols:
-        submission[col] = (
-            pd.to_numeric(submission[col], errors="coerce").fillna(0).astype(int)
-        )
+        # Initialize prediction columns
+        for col in [
+            "predicted_state_idx_1",
+            "predicted_state_idx_2",
+            "predicted_state_idx_3",
+            "predicted_state_idx_4",
+            "predicted_state_idx_5",
+            "predicted_latitude",
+            "predicted_longitude",
+        ]:
+            submission[col] = np.nan
 
-    # Reorder columns to match required order
-    submission = submission[required_cols]
+        # Write predictions back by sample_id alignment
+        id_to_row = {
+            int(sid): i for i, sid in enumerate(submission["sample_id"].values)
+        }
+        for sid, t5, ll in zip(ids, top5_idx, latlon):
+            r = id_to_row[int(sid)]
+            # Ensure state IDs are integers
+            submission.loc[r, "predicted_state_idx_1"] = int(t5[0])
+            submission.loc[r, "predicted_state_idx_2"] = int(t5[1])
+            submission.loc[r, "predicted_state_idx_3"] = int(t5[2])
+            submission.loc[r, "predicted_state_idx_4"] = int(t5[3])
+            submission.loc[r, "predicted_state_idx_5"] = int(t5[4])
+            submission.loc[r, "predicted_latitude"] = float(ll[0])
+            submission.loc[r, "predicted_longitude"] = float(ll[1])
 
-    out_path = Path(args.out_csv)
-    submission.to_csv(out_path, index=False)
-    print(f"Wrote submission to: {out_path}")
+        # Ensure state ID columns are integers (convert any remaining NaN/invalid to 0)
+        state_cols = [
+            "predicted_state_idx_1",
+            "predicted_state_idx_2",
+            "predicted_state_idx_3",
+            "predicted_state_idx_4",
+            "predicted_state_idx_5",
+        ]
+        for col in state_cols:
+            submission[col] = (
+                pd.to_numeric(submission[col], errors="coerce").fillna(0).astype(int)
+            )
+
+        # Reorder columns to match required order
+        submission = submission[required_cols]
+
+        out_path = Path(args.out_csv)
+        submission.to_csv(out_path, index=False)
+        print(f"Wrote submission to: {out_path}")
+
+    destroy_process_group(dist_state)
 
 
 if __name__ == "__main__":

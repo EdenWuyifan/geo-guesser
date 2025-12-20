@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import numpy as np
 import torch
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, random_split
+from torch.utils.data.distributed import DistributedSampler
 
 from datasets import StateIndexMapper, StreetViewDataset, collate_streetview
 
@@ -27,6 +29,15 @@ from self_supervised_losses import SelfSupervisedLoss
 
 from geo_cell import build_geo_cells
 
+from dist_utils import (
+    DistState,
+    all_reduce_sum_,
+    barrier,
+    init_distributed,
+    is_main_process,
+    destroy_process_group,
+)
+
 
 # ANSI color codes for pretty printing
 class Colors:
@@ -44,6 +55,8 @@ class Colors:
 
 def log_step(step: str, message: str = "", level: str = "info") -> None:
     """Print a formatted log message."""
+    if not is_main_process() and level != "error":
+        return
     timestamp = datetime.now().strftime("%H:%M:%S")
     colors = {
         "header": Colors.HEADER + Colors.BOLD,
@@ -67,6 +80,8 @@ def log_step(step: str, message: str = "", level: str = "info") -> None:
 
 def log_section(title: str) -> None:
     """Print a section header."""
+    if not is_main_process():
+        return
     print(f"\n{Colors.BOLD}{Colors.HEADER}{'='*70}{Colors.END}")
     print(f"{Colors.BOLD}{Colors.HEADER}{title:^70}{Colors.END}")
     print(f"{Colors.BOLD}{Colors.HEADER}{'='*70}{Colors.END}\n")
@@ -104,8 +119,6 @@ def find_latest_checkpoint(out_dir: Path) -> Path | None:
 
 
 def main() -> None:
-    log_section("🌍 GeoGuessr Training Setup")
-
     def build_arg_parser() -> argparse.ArgumentParser:
         ap = argparse.ArgumentParser()
 
@@ -279,6 +292,16 @@ def main() -> None:
     ap = build_arg_parser()
     args = ap.parse_args()
 
+    dist_state: DistState = init_distributed(args.device)
+
+    log_section("🌍 GeoGuessr Training Setup")
+    if dist_state.distributed:
+        log_step(
+            "Distributed",
+            f"torchrun/DDP enabled (rank {dist_state.rank}/{dist_state.world_size}, local_rank={dist_state.local_rank})",
+            level="success",
+        )
+
     # Convenience default: if the user switches encoder_type but leaves the default DINO id,
     # automatically pick the StreetCLIP model id.
     if (
@@ -337,7 +360,7 @@ def main() -> None:
     log_step("", f"  Seed: {args.seed}")
 
     log_step("Seeding", f"Setting random seed to {args.seed}...")
-    seed_everything(args.seed)
+    seed_everything(args.seed + dist_state.rank)
 
     data_dir = Path(args.data_dir)
     train_csv = data_dir / args.train_csv
@@ -363,10 +386,11 @@ def main() -> None:
     else:
         log_step("Resume", "No existing checkpoint found, starting from scratch")
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    device = dist_state.device
     if device.type == "cuda":
-        log_step("Device", f"Using CUDA: {torch.cuda.get_device_name(0)}")
-        gpu_props = torch.cuda.get_device_properties(0)
+        device_idx = torch.cuda.current_device()
+        log_step("Device", f"Using CUDA: {torch.cuda.get_device_name(device_idx)}")
+        gpu_props = torch.cuda.get_device_properties(device_idx)
         log_step(
             "",
             f"  GPU Memory: {gpu_props.total_memory / 1e9:.2f} GB",
@@ -455,6 +479,11 @@ def main() -> None:
             )
 
     effective_batch_size = args.batch_size * args.gradient_accumulation_steps
+    global_effective_batch_size = (
+        effective_batch_size * dist_state.world_size
+        if dist_state.distributed
+        else effective_batch_size
+    )
     log_step(
         "DataLoader",
         f"Creating DataLoader (batch_size={args.batch_size}, "
@@ -464,12 +493,28 @@ def main() -> None:
         log_step(
             "",
             f"Gradient accumulation: {args.gradient_accumulation_steps} steps "
-            f"(effective batch size: {effective_batch_size})",
+            f"(effective batch size per process: {effective_batch_size})",
         )
+    if dist_state.distributed:
+        log_step("", f"Global effective batch size: {global_effective_batch_size}")
+
+    train_sampler = (
+        DistributedSampler(
+            train_ds,
+            num_replicas=dist_state.world_size,
+            rank=dist_state.rank,
+            shuffle=True,
+            seed=args.seed,
+            drop_last=False,
+        )
+        if dist_state.distributed
+        else None
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
@@ -479,16 +524,29 @@ def main() -> None:
     log_step("Success", f"Batches per epoch: {len(train_loader):,}")
 
     val_loader = None
+    val_sampler = None
     if val_ds is not None:
         val_workers = (
             args.val_num_workers
             if args.val_num_workers is not None
             else args.num_workers
         )
+        val_sampler = (
+            DistributedSampler(
+                val_ds,
+                num_replicas=dist_state.world_size,
+                rank=dist_state.rank,
+                shuffle=False,
+                drop_last=False,
+            )
+            if dist_state.distributed
+            else None
+        )
         val_loader = DataLoader(
             val_ds,
             batch_size=args.batch_size,
             shuffle=False,
+            sampler=val_sampler,
             num_workers=val_workers,
             pin_memory=(device.type == "cuda"),
             prefetch_factor=(
@@ -500,19 +558,32 @@ def main() -> None:
         log_step("Validation", f"Val batches per epoch: {len(val_loader):,}")
 
     log_section("🗺️  Geo-Cell Building")
-    log_step("Building", f"Creating geo cells using method: {args.geo_method}...")
-    geo_cells = build_geo_cells(
-        train_csv,
-        method=args.geo_method,
-        s2_level=args.s2_level,
-        num_cells=args.num_cells,
-    )
-    centroids_np = geo_cells.centroids_latlon
-    cell_ids_np = geo_cells.cell_ids
-    log_step("Success", f"Created {len(centroids_np):,} geo cells")
-    log_step("", f"  Method: {geo_cells.meta.get('method', 'unknown')}")
-    if "s2_level" in geo_cells.meta:
-        log_step("", f"  S2 Level: {geo_cells.meta['s2_level']}")
+    centroids_file = out_dir / "geo_cell_centroids.npy"
+    cell_ids_file = out_dir / "geo_cell_ids.npy"
+    if dist_state.distributed and not dist_state.main:
+        barrier(dist_state)
+        centroids_np = np.load(centroids_file)
+        cell_ids_np = np.load(cell_ids_file)
+    else:
+        log_step("Building", f"Creating geo cells using method: {args.geo_method}...")
+        geo_cells = build_geo_cells(
+            train_csv,
+            method=args.geo_method,
+            s2_level=args.s2_level,
+            num_cells=args.num_cells,
+        )
+        centroids_np = geo_cells.centroids_latlon
+        cell_ids_np = geo_cells.cell_ids
+        log_step("Success", f"Created {len(centroids_np):,} geo cells")
+        log_step("", f"  Method: {geo_cells.meta.get('method', 'unknown')}")
+        if "s2_level" in geo_cells.meta:
+            log_step("", f"  S2 Level: {geo_cells.meta['s2_level']}")
+
+        log_step("Saving", "Saving geo cell data...")
+        np.save(centroids_file, centroids_np)
+        np.save(cell_ids_file, cell_ids_np)
+        log_step("Success", f"Saved to {out_dir}")
+        barrier(dist_state)
 
     # Pre-allocate cell_ids tensor on GPU for faster batch lookup (using row_idx from dataset)
     cell_ids_tensor = torch.from_numpy(cell_ids_np).to(device)
@@ -520,11 +591,6 @@ def main() -> None:
         device=device, dtype=torch.float32
     )
     log_step("Pre-allocation", "Pre-allocated cell_ids tensor on GPU")
-
-    log_step("Saving", "Saving geo cell data...")
-    np.save(out_dir / "geo_cell_centroids.npy", centroids_np)
-    np.save(out_dir / "geo_cell_ids.npy", cell_ids_np)
-    log_step("Success", f"Saved to {out_dir}")
 
     log_section("🧠 Model Initialization")
 
@@ -714,6 +780,21 @@ def main() -> None:
             "Compile",
             "Model compilation disabled (use --compile_model full/heads to enable)",
         )
+
+    if dist_state.distributed:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+
+        model = (
+            DDP(
+                model,
+                device_ids=[dist_state.local_rank] if device.type == "cuda" else None,
+                output_device=(dist_state.local_rank if device.type == "cuda" else None),
+                broadcast_buffers=False,
+            )
+            if device.type == "cuda"
+            else DDP(model)
+        )
+        log_step("DDP", "Wrapped model with DistributedDataParallel", level="success")
 
     # Count trainable parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -1052,10 +1133,11 @@ def main() -> None:
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
+        device_idx = torch.cuda.current_device()
         log_step(
             "Memory",
             f"Initial GPU memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB / "
-            f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB",
+            f"{torch.cuda.get_device_properties(device_idx).total_memory / 1e9:.2f} GB",
         )
     model.train()
 
@@ -1142,6 +1224,15 @@ def main() -> None:
                 gps_km_sum += haversine_km(pred_latlon.detach(), latlon).sum()
                 seen_val += bs
 
+        if dist_state.distributed:
+            all_reduce_sum_(val_total, dist_state)
+            all_reduce_sum_(val_state, dist_state)
+            all_reduce_sum_(val_cell, dist_state)
+            all_reduce_sum_(val_gps, dist_state)
+            all_reduce_sum_(state_correct, dist_state)
+            all_reduce_sum_(gps_km_sum, dist_state)
+            all_reduce_sum_(seen_val, dist_state)
+
         model.train()
 
         return {
@@ -1154,9 +1245,14 @@ def main() -> None:
         }
 
     for epoch in range(start_epoch, args.epochs + 1):
-        print(f"\n{Colors.BOLD}{Colors.CYAN}{'─'*70}{Colors.END}")
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        if is_main_process():
+            print(f"\n{Colors.BOLD}{Colors.CYAN}{'─'*70}{Colors.END}")
         log_step("Epoch", f"{epoch}/{args.epochs}", level="header")
-        print(f"{Colors.BOLD}{Colors.CYAN}{'─'*70}{Colors.END}\n")
+        if is_main_process():
+            print(f"{Colors.BOLD}{Colors.CYAN}{'─'*70}{Colors.END}\n")
 
         # Use GPU tensors for accumulation to avoid CPU sync on every batch
         running_total = torch.zeros((), device=device, dtype=torch.float32)
@@ -1233,15 +1329,23 @@ def main() -> None:
 
             # Scale loss by accumulation steps for correct averaging
             scaled_loss = total_loss / args.gradient_accumulation_steps
-            if scaler.is_enabled():
-                scaler.scale(scaled_loss).backward()
-            else:
-                scaled_loss.backward()
+            should_step = (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (
+                (batch_idx + 1) == len(train_loader)
+            )
+            no_sync = getattr(model, "no_sync", None)
+            backward_ctx = (
+                nullcontext()
+                if (not dist_state.distributed or should_step or no_sync is None)
+                else no_sync()
+            )
+            with backward_ctx:
+                if scaler.is_enabled():
+                    scaler.scale(scaled_loss).backward()
+                else:
+                    scaled_loss.backward()
 
             # Only step optimizer after accumulating gradients
-            if (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (
-                batch_idx + 1
-            ) == len(train_loader):
+            if should_step:
                 if args.grad_clip_norm and args.grad_clip_norm > 0:
                     if scaler.is_enabled():
                         scaler.unscale_(optim)
@@ -1266,7 +1370,9 @@ def main() -> None:
                 seen += bs
 
             # Progress update every 100 batches (only sync GPU->CPU here)
-            if (batch_idx + 1) % 100 == 0 or (batch_idx + 1) == len(train_loader):
+            if is_main_process() and (
+                (batch_idx + 1) % 100 == 0 or (batch_idx + 1) == len(train_loader)
+            ):
                 progress_pct = 100 * (batch_idx + 1) / len(train_loader)
                 current_loss = (
                     running_total / seen
@@ -1279,27 +1385,35 @@ def main() -> None:
                     flush=True,
                 )
 
+        if dist_state.distributed:
+            all_reduce_sum_(running_total, dist_state)
+            all_reduce_sum_(running_state, dist_state)
+            all_reduce_sum_(running_cell, dist_state)
+            all_reduce_sum_(running_gps, dist_state)
+            all_reduce_sum_(seen, dist_state)
+
         # Epoch summary (sync GPU->CPU only once at epoch end)
         avg_total = (running_total / seen).item()
         avg_state = (running_state / seen).item()
         avg_cell = (running_cell / seen).item() if track_cell_loss else None
         avg_gps = (running_gps / seen).item()
-        print(f"\n{Colors.BOLD}Epoch {epoch} Summary:{Colors.END}")
-        summary = (
-            f"  {Colors.GREEN}Total Loss:{Colors.END} {avg_total:.6f} | "
-            f"{Colors.BLUE}State:{Colors.END} {avg_state:.6f}"
-        )
-        if track_cell_loss and avg_cell is not None:
-            summary += f" | {Colors.BLUE}Cell:{Colors.END} {avg_cell:.6f}"
-        summary += f" | {Colors.BLUE}GPS:{Colors.END} {avg_gps:.6f}"
-        print(summary)
-        print(
-            f"  {Colors.CYAN}Note:{Colors.END} Total includes self-supervised losses "
-            f"(view consistency + geo-distance contrastive)"
-        )
+        if is_main_process():
+            print(f"\n{Colors.BOLD}Epoch {epoch} Summary:{Colors.END}")
+            summary = (
+                f"  {Colors.GREEN}Total Loss:{Colors.END} {avg_total:.6f} | "
+                f"{Colors.BLUE}State:{Colors.END} {avg_state:.6f}"
+            )
+            if track_cell_loss and avg_cell is not None:
+                summary += f" | {Colors.BLUE}Cell:{Colors.END} {avg_cell:.6f}"
+            summary += f" | {Colors.BLUE}GPS:{Colors.END} {avg_gps:.6f}"
+            print(summary)
+            print(
+                f"  {Colors.CYAN}Note:{Colors.END} Total includes self-supervised losses "
+                f"(view consistency + geo-distance contrastive)"
+            )
 
         val_metrics = run_validation()
-        if val_metrics:
+        if val_metrics and is_main_process():
             val_summary = (
                 f"  {Colors.GREEN}Val Total:{Colors.END} {val_metrics['avg_total']:.6f} | "
                 f"{Colors.BLUE}State:{Colors.END} {val_metrics['avg_state']:.6f}"
@@ -1323,13 +1437,19 @@ def main() -> None:
             if best_val_total is None or val_metrics["avg_total"] < best_val_total:
                 best_val_total = val_metrics["avg_total"]
                 best_epoch = epoch
+
                 best_ckpt_path = out_dir / "model_best.pt"
                 best_centroids_path = out_dir / "geo_cell_centroids_best.npy"
                 np.save(best_centroids_path, centroids_np)
+                model_state = (
+                    model.module.state_dict()
+                    if hasattr(model, "module")
+                    else model.state_dict()
+                )
                 torch.save(
                     {
                         "epoch": epoch,
-                        "model": model.state_dict(),
+                        "model": model_state,
                         "optimizer": optim.state_dict(),
                         "scaler": scaler.state_dict(),
                         "config": {
@@ -1379,62 +1499,77 @@ def main() -> None:
                     level="success",
                 )
 
-        log_step("Saving", f"Saving checkpoint for epoch {epoch}...")
-        ckpt_path = out_dir / f"model_epoch_{epoch}.pt"
+        if is_main_process():
+            log_step("Saving", f"Saving checkpoint for epoch {epoch}...")
+            ckpt_path = out_dir / f"model_epoch_{epoch}.pt"
 
-        # Save geo cell centroids alongside checkpoint
-        centroids_path = out_dir / f"geo_cell_centroids_epoch_{epoch}.npy"
-        np.save(centroids_path, centroids_np)
+            # Save geo cell centroids alongside checkpoint
+            centroids_path = out_dir / f"geo_cell_centroids_epoch_{epoch}.npy"
+            np.save(centroids_path, centroids_np)
 
-        torch.save(
-            {
-                "epoch": epoch,
-                "model": model.state_dict(),
-                "optimizer": optim.state_dict(),
-                "scaler": scaler.state_dict(),
-                "config": {
-                    "encoder_type": args.encoder_type,
-                    "hf_model_id": args.hf_model_id,
-                    "state_mapping": args.state_mapping,
-                    "embed_dim": embed_dim,
-                    "num_states": num_states,
-                    "num_cells": len(centroids_np),
-                    "use_mixture": geo_head_type == "mixture",
-                    "geo_head_type": geo_head_type,
-                    "num_components": (
-                        num_components if geo_head_type == "mixture" else None
-                    ),
-                    "use_cell_aux": (
-                        mixture_use_cell_aux if geo_head_type == "mixture" else False
-                    ),
-                    "gps_loss": gps_loss_type,
-                    "state_smoothing": state_smoothing,
-                    "lambda_state": lambda_state,
-                    "lambda_cell": lambda_cell,
-                    "lambda_gps": lambda_gps,
-                    "lambda_view_consistency": args.lambda_view_consistency,
-                    "lambda_geo_distance": args.lambda_geo_distance,
-                    "encoder_trainable_layers": encoder_trainable_layers,
-                    "encoder_lr_scale": encoder_lr_scale,
-                    "encoder_llrd_decay": encoder_llrd_decay,
-                    "lora_lr_scale": lora_lr_scale,
-                    "lora_rank": lora_rank,
-                    "lora_alpha": lora_alpha,
-                    "lora_layers": lora_layers,
-                    "geo_method": args.geo_method,
-                    "fusion_layers": args.fusion_layers,
-                    "fusion_heads": args.fusion_heads,
-                    "fusion_dropout": args.fusion_dropout,
+            model_state = (
+                model.module.state_dict()
+                if hasattr(model, "module")
+                else model.state_dict()
+            )
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": model_state,
+                    "optimizer": optim.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "config": {
+                        "encoder_type": args.encoder_type,
+                        "hf_model_id": args.hf_model_id,
+                        "state_mapping": args.state_mapping,
+                        "embed_dim": embed_dim,
+                        "num_states": num_states,
+                        "num_cells": len(centroids_np),
+                        "use_mixture": geo_head_type == "mixture",
+                        "geo_head_type": geo_head_type,
+                        "num_components": (
+                            num_components if geo_head_type == "mixture" else None
+                        ),
+                        "use_cell_aux": (
+                            mixture_use_cell_aux
+                            if geo_head_type == "mixture"
+                            else False
+                        ),
+                        "gps_loss": gps_loss_type,
+                        "state_smoothing": state_smoothing,
+                        "lambda_state": lambda_state,
+                        "lambda_cell": lambda_cell,
+                        "lambda_gps": lambda_gps,
+                        "lambda_view_consistency": args.lambda_view_consistency,
+                        "lambda_geo_distance": args.lambda_geo_distance,
+                        "encoder_trainable_layers": encoder_trainable_layers,
+                        "encoder_lr_scale": encoder_lr_scale,
+                        "encoder_llrd_decay": encoder_llrd_decay,
+                        "lora_lr_scale": lora_lr_scale,
+                        "lora_rank": lora_rank,
+                        "lora_alpha": lora_alpha,
+                        "lora_layers": lora_layers,
+                        "geo_method": args.geo_method,
+                        "fusion_layers": args.fusion_layers,
+                        "fusion_heads": args.fusion_heads,
+                        "fusion_dropout": args.fusion_dropout,
+                    },
+                    "centroids_path": str(centroids_path),
                 },
-                "centroids_path": str(centroids_path),
-            },
-            ckpt_path,
-        )
-        log_step("Success", f"Saved to {ckpt_path}", level="success")
+                ckpt_path,
+            )
+            log_step("Success", f"Saved to {ckpt_path}", level="success")
+
+        barrier(dist_state)
 
     log_section("✅ Training Complete")
     log_step("Complete", f"All checkpoints saved to: {out_dir}", level="success")
-    print(f"\n{Colors.BOLD}{Colors.GREEN}Training finished successfully!{Colors.END}\n")
+    if is_main_process():
+        print(
+            f"\n{Colors.BOLD}{Colors.GREEN}Training finished successfully!{Colors.END}\n"
+        )
+
+    destroy_process_group(dist_state)
 
 
 if __name__ == "__main__":
