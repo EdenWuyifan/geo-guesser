@@ -14,6 +14,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from datasets import StateIndexMapper, StreetViewDataset, collate_streetview
 
+from models.dinov2 import DinoV2Encoder
 from models.dinov3 import DinoV3Encoder  # HuggingFace-backed encoder
 from models.streetclip import StreetCLIPEncoder
 from models.fusion_transformer import DirectionalFusionTransformer
@@ -184,8 +185,8 @@ def main() -> None:
             "--encoder_type",
             type=str,
             default="dinov3",
-            choices=["dinov3", "streetclip"],
-            help="Backbone encoder: 'dinov3' (default) or 'streetclip' (CLIP ViT-L/14@336 pretrained for geolocalization).",
+            choices=["dinov3", "dinov2", "streetclip"],
+            help="Backbone encoder: 'dinov3' (default), 'dinov2', or 'streetclip' (CLIP ViT-L/14@336 pretrained for geolocalization).",
         )
         ap.add_argument(
             "--hf_model_id",
@@ -193,6 +194,7 @@ def main() -> None:
             default="facebook/dinov3-vit7b16-pretrain-lvd1689m",
             help="HuggingFace model id for the encoder. "
             "For --encoder_type dinov3: 'facebook/dinov3-vit7b16-pretrain-lvd1689m' (default). "
+            "For --encoder_type dinov2: 'facebook/dinov2-vitb14' (recommended default). "
             "For --encoder_type streetclip: 'geolocal/StreetCLIP'. "
             "Faster DINO alternatives: 'facebook/dinov2-vitb14' (base), 'facebook/dinov2-vits14' (small).",
         )
@@ -302,8 +304,19 @@ def main() -> None:
             level="success",
         )
 
-    # Convenience default: if the user switches encoder_type but leaves the default DINO id,
-    # automatically pick the StreetCLIP model id.
+    # Convenience defaults: if the user switches encoder_type but leaves the DINOv3 default id,
+    # automatically pick a sensible default model id.
+    if (
+        args.encoder_type == "dinov2"
+        and args.hf_model_id == "facebook/dinov3-vit7b16-pretrain-lvd1689m"
+    ):
+        log_step(
+            "Note",
+            "Using DINOv2 encoder; switching --hf_model_id to 'facebook/dinov2-vitb14' (was DINOv3 default).",
+            level="warning",
+        )
+        args.hf_model_id = "facebook/dinov2-vitb14"
+
     if (
         args.encoder_type == "streetclip"
         and args.hf_model_id == "facebook/dinov3-vit7b16-pretrain-lvd1689m"
@@ -420,7 +433,9 @@ def main() -> None:
     # --- Encoder preprocessing params (mean/std/size) from HF processor
     log_step("Encoder Config", f"Fetching processor params for {args.hf_model_id}...")
     if args.encoder_type == "dinov3":
-        pp = DinoV3Encoder.processor_params(args.hf_model_id)
+        pp = DinoV3Encoder.processor_params(args.hf_model_id, trust_remote_code=True)
+    elif args.encoder_type == "dinov2":
+        pp = DinoV3Encoder.processor_params(args.hf_model_id, trust_remote_code=False)
     elif args.encoder_type == "streetclip":
         pp = StreetCLIPEncoder.processor_params(args.hf_model_id)
     else:
@@ -617,6 +632,18 @@ def main() -> None:
         encoder = DinoV3Encoder(
             model_id=args.hf_model_id,
             freeze=True,  # Start frozen; optionally unfreeze last blocks below
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+            use_lora=True,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_layers=lora_layers,
+            trainable_layers=encoder_trainable_layers,
+        ).to(device)
+    elif args.encoder_type == "dinov2":
+        encoder = DinoV2Encoder(
+            model_id=args.hf_model_id,
+            freeze=True,
             torch_dtype=torch_dtype,
             use_lora=True,
             lora_rank=lora_rank,

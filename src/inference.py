@@ -12,6 +12,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from datasets import StateIndexMapper, StreetViewDataset, collate_streetview
 
+from models.dinov2 import DinoV2Encoder
 from models.dinov3 import DinoV3Encoder
 from models.streetclip import StreetCLIPEncoder
 from models.fusion_transformer import DirectionalFusionTransformer
@@ -118,7 +119,9 @@ def main() -> None:
 
     # Load encoder preprocessing params
     if encoder_type == "dinov3":
-        pp = DinoV3Encoder.processor_params(hf_model_id)
+        pp = DinoV3Encoder.processor_params(hf_model_id, trust_remote_code=True)
+    elif encoder_type == "dinov2":
+        pp = DinoV3Encoder.processor_params(hf_model_id, trust_remote_code=False)
     elif encoder_type == "streetclip":
         pp = StreetCLIPEncoder.processor_params(hf_model_id)
     else:
@@ -158,6 +161,17 @@ def main() -> None:
         print("Building model from checkpoint configuration...")
     if encoder_type == "dinov3":
         encoder = DinoV3Encoder(
+            model_id=hf_model_id,
+            freeze=True,
+            trust_remote_code=True,
+            use_lora=True,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_layers=lora_layers,
+            trainable_layers=0,
+        )
+    elif encoder_type == "dinov2":
+        encoder = DinoV2Encoder(
             model_id=hf_model_id,
             freeze=True,
             use_lora=True,

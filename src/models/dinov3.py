@@ -17,7 +17,7 @@ class EncoderOutput:
 
 class DinoV3Encoder(nn.Module):
     """
-    Hugging Face DINOv3 encoder for per-view embeddings.
+    Hugging Face DINO encoder for per-view embeddings.
 
     Model id (as requested):
       facebook/dinov3-vit7b16-pretrain-lvd1689m
@@ -31,6 +31,7 @@ class DinoV3Encoder(nn.Module):
         model_id: str = "facebook/dinov3-vit7b16-pretrain-lvd1689m",
         freeze: bool = True,
         torch_dtype: Optional[torch.dtype] = None,
+        trust_remote_code: bool = True,
         use_lora: bool = False,
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
@@ -42,6 +43,8 @@ class DinoV3Encoder(nn.Module):
             model_id: HuggingFace model identifier
             freeze: Whether to freeze backbone (if True, only LoRA params are trainable)
             torch_dtype: Optional dtype for model weights
+            trust_remote_code: Hugging Face flag for allowing custom model code.
+                DINOv3 may require this; DINOv2 typically does not.
             use_lora: Enable LoRA adapters on last N blocks
             lora_rank: LoRA rank (r)
             lora_alpha: LoRA scaling factor
@@ -56,10 +59,12 @@ class DinoV3Encoder(nn.Module):
         self.lora_layers = lora_layers
         self.trainable_layers = trainable_layers
 
-        self.config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        self.config = AutoConfig.from_pretrained(
+            model_id, trust_remote_code=trust_remote_code
+        )
         self.backbone = AutoModel.from_pretrained(
             model_id,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             torch_dtype=torch_dtype,
         )
 
@@ -83,12 +88,14 @@ class DinoV3Encoder(nn.Module):
             self.unfreeze_last_blocks(trainable_layers)
 
     @staticmethod
-    def processor_params(model_id: str) -> dict:
+    def processor_params(model_id: str, trust_remote_code: bool = True) -> dict:
         """
         Returns recommended preprocessing parameters from HF ImageProcessor.
         Use these in your torchvision transforms for consistency.
         """
-        proc = AutoImageProcessor.from_pretrained(model_id, trust_remote_code=True)
+        proc = AutoImageProcessor.from_pretrained(
+            model_id, trust_remote_code=trust_remote_code
+        )
         size = proc.size
         # Common patterns: {"height": 224, "width": 224} or {"shortest_edge": 224}
         image_size = size.get("height") or size.get("shortest_edge") or 224
@@ -128,7 +135,7 @@ class DinoV3Encoder(nn.Module):
 
         if blocks is None:
             raise ValueError(
-                "Could not find transformer blocks in DINOv3 backbone. "
+                "Could not find transformer blocks in DINO backbone. "
                 "Please check the model architecture."
             )
 

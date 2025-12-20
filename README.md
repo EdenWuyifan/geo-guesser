@@ -251,6 +251,22 @@ We train a 4-view fusion model with a DINOv3 encoder (frozen backbone + LoRA ada
   --val_split 0.05
 ```
 
+### Optional: Train DINOv2 for GPS (this repo)
+
+DINOv2 uses the same training script; just switch the encoder type + model id:
+
+```bash
+.venv/bin/python src/train.py \
+  --encoder_type dinov2 \
+  --hf_model_id facebook/dinov2-vitb14 \
+  --data_dir data \
+  --out_dir checkpoints_dinov2 \
+  --epochs 5 \
+  --batch_size 32 \
+  --gradient_accumulation_steps 4 \
+  --val_split 0.05
+```
+
 Multi-GPU (DDP) example (2 GPUs). `--batch_size` is per-GPU:
 
 ```bash
